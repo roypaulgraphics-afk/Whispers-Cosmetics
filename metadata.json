@@ -1,0 +1,6 @@
+{
+  "name": "Whispers Cosmetics",
+  "description": "Inventory management, barcode POS, M-Pesa reconciliation, dynamic pricing, and credit tracking system for Whispers Cosmetics.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}
