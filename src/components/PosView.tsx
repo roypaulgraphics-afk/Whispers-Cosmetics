@@ -4,13 +4,16 @@ import {
   CheckCircle2,
   Minus,
   Plus,
+  Printer,
   Receipt,
   ScanBarcode,
   Search,
+  Send,
   ShoppingBag,
   Smartphone,
   Trash2,
   UserCheck,
+  X,
 } from 'lucide-react';
 import {
   MpesaDetails,
@@ -24,6 +27,7 @@ import {
 } from '../types';
 import { ProductThumbnail } from './ProductThumbnail';
 import { MpesaMessagePanel } from './MpesaMessagePanel';
+import { generateSimulatedMpesaSms, parseMpesaMessage } from '../lib/mpesaParser';
 
 interface PosViewProps {
   products: Product[];
@@ -56,7 +60,11 @@ export const PosView: React.FC<PosViewProps> = ({
   const [cart, setCart] = useState<Array<{ product: Product; quantity: number }>>([]);
   const [paymentMode, setPaymentMode] = useState<PaymentMode>('Cash');
 
-  // M-Pesa message state
+  // M-Pesa mode: 'prompt' (STK Push to customer phone) or 'sms' (Access / paste M-Pesa SMS)
+  const [mpesaFlow, setMpesaFlow] = useState<'prompt' | 'sms'>('prompt');
+  const [customerMpesaPhone, setCustomerMpesaPhone] = useState('');
+  const [customerMpesaName, setCustomerMpesaName] = useState('');
+  const [stkState, setStkState] = useState<'idle' | 'sent' | 'confirmed'>('idle');
   const [mpesaRawMsg, setMpesaRawMsg] = useState('');
   const [mpesaParsed, setMpesaParsed] = useState<MpesaDetails | undefined>(undefined);
   const [mpesaValid, setMpesaValid] = useState(false);
@@ -72,6 +80,10 @@ export const PosView: React.FC<PosViewProps> = ({
   });
   const [initialDeposit, setInitialDeposit] = useState('');
   const [creditNotes, setCreditNotes] = useState('');
+
+  // Payment Prompt Modal state
+  const [payPromptOpen, setPayPromptOpen] = useState(false);
+  const [cashTendered, setCashTendered] = useState('');
 
   const [scanNotice, setScanNotice] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -129,7 +141,9 @@ export const PosView: React.FC<PosViewProps> = ({
 
   const handleBarcodeScanned = (code: string) => {
     const match = products.find(
-      (p) => p.barcode.toLowerCase() === code.trim().toLowerCase() || p.sku.toLowerCase() === code.trim().toLowerCase(),
+      (p) =>
+        p.barcode.toLowerCase() === code.trim().toLowerCase() ||
+        p.sku.toLowerCase() === code.trim().toLowerCase(),
     );
     if (match) {
       addToCart(match);
@@ -139,10 +153,42 @@ export const PosView: React.FC<PosViewProps> = ({
     }
   };
 
-  const handleCheckout = async () => {
+  const handleSendStkPrompt = () => {
+    const phone = customerMpesaPhone.trim();
+    if (!/^(?:\+?254|0)[17]\d{8}$/.test(phone.replace(/\s+/g, ''))) {
+      setScanNotice('Enter a valid Kenyan M-Pesa phone number (e.g. 0712345678).');
+      return;
+    }
+    setScanNotice('');
+    setStkState('sent');
+  };
+
+  const handleConfirmStkPrompt = () => {
+    const phone = customerMpesaPhone.trim() || '0712345678';
+    const sender = (customerMpesaName.trim() || 'M-PESA CUSTOMER').toUpperCase();
+    const sms = generateSimulatedMpesaSms(cartTotal, settings.mpesaTillNumber, sender, phone);
+    const parsed = parseMpesaMessage(sms, cartTotal);
+    setMpesaRawMsg(sms);
+    setMpesaParsed(parsed.details);
+    setMpesaValid(parsed.valid);
+    setStkState('confirmed');
+  };
+
+  const openPaymentPrompt = () => {
+    if (cart.length === 0) return;
+    if (paymentMode === 'Credit' && !creditorName.trim()) {
+      setScanNotice('Please enter the creditor name before proceeding.');
+      return;
+    }
+    setScanNotice('');
+    setCashTendered(String(cartTotal));
+    setPayPromptOpen(true);
+  };
+
+  const handleConfirmSale = async () => {
     if (cart.length === 0 || submitting) return;
     if (paymentMode === 'Mpesa' && !mpesaRawMsg.trim()) {
-      setScanNotice('Please paste or access the M-Pesa confirmation message first.');
+      setScanNotice('Send & confirm the M-Pesa prompt or attach an M-Pesa SMS first.');
       return;
     }
     if (paymentMode === 'Credit' && !creditorName.trim()) {
@@ -177,24 +223,32 @@ export const PosView: React.FC<PosViewProps> = ({
 
       if (tx) {
         setLastReceipt(tx);
+        setPayPromptOpen(false);
         setCart([]);
         setMpesaRawMsg('');
         setMpesaParsed(undefined);
         setMpesaValid(false);
+        setStkState('idle');
+        setCustomerMpesaPhone('');
+        setCustomerMpesaName('');
         setCreditorName('');
         setCreditorPhone('');
         setInitialDeposit('');
         setCreditNotes('');
+        setCashTendered('');
       }
     } finally {
       setSubmitting(false);
     }
   };
 
+  const tenderedNum = Number(cashTendered || 0);
+  const changeDue = Math.max(0, tenderedNum - cartTotal);
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
       {/* Left: Catalog & Barcode Search */}
-      <div className="lg:col-span-7 space-y-4">
+      <div className="lg:col-span-7 space-y-4 no-print">
         <div className="flex flex-col sm:flex-row gap-3">
           <div className="relative flex-1">
             <Search className="w-4 h-4 text-stone-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
@@ -211,7 +265,7 @@ export const PosView: React.FC<PosViewProps> = ({
                   }
                 }
               }}
-              placeholder="Search product name, SKU, or scan barcode..."
+              placeholder="Search product name or scan barcode..."
               className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-sm text-stone-900 dark:text-zinc-100 placeholder:text-stone-400 focus:outline-none focus:ring-2 focus:ring-rose-800/30"
             />
           </div>
@@ -334,7 +388,7 @@ export const PosView: React.FC<PosViewProps> = ({
 
       {/* Right: Active Checkout Basket & Payment Mode */}
       <div className="lg:col-span-5 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6 space-y-5 lg:sticky lg:top-6">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between no-print">
           <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100 flex items-center gap-2">
             <ShoppingBag className="w-4 h-4 text-rose-900 dark:text-rose-400" />
             <span>Current Sale</span>
@@ -350,33 +404,56 @@ export const PosView: React.FC<PosViewProps> = ({
           )}
         </div>
 
+        {/* Completed Receipt Card */}
         {lastReceipt && cart.length === 0 && (
-          <div className="rounded-xl border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50 dark:bg-emerald-950/30 p-4 flex items-start gap-3">
-            <CheckCircle2 className="w-5 h-5 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
-            <div className="text-xs space-y-1">
-              <p className="font-semibold text-emerald-900 dark:text-emerald-200">
-                Sale Completed · Receipt {lastReceipt.receiptNo}
-              </p>
-              <p className="text-emerald-800 dark:text-emerald-300 font-mono-num">
-                Total: {settings.currency} {lastReceipt.totalAmount.toLocaleString()} via{' '}
-                {lastReceipt.paymentMode}
-                {lastReceipt.mpesaDetails?.transactionCode
-                  ? ` (${lastReceipt.mpesaDetails.transactionCode})`
-                  : ''}
-              </p>
+          <div className="rounded-xl border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50 dark:bg-emerald-950/30 p-4 space-y-3">
+            <div className="flex items-start gap-3">
+              <CheckCircle2 className="w-5 h-5 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
+              <div className="text-xs space-y-1 flex-1">
+                <p className="font-semibold text-emerald-900 dark:text-emerald-200">
+                  Sale Completed · Receipt {lastReceipt.receiptNo}
+                </p>
+                <p className="text-emerald-800 dark:text-emerald-300 font-mono-num">
+                  Total: {settings.currency} {lastReceipt.totalAmount.toLocaleString()} via{' '}
+                  {lastReceipt.paymentMode}
+                  {lastReceipt.mpesaDetails?.transactionCode
+                    ? ` (${lastReceipt.mpesaDetails.transactionCode})`
+                    : ''}
+                </p>
+                <p className="text-emerald-700/90 dark:text-emerald-300/80">
+                  {lastReceipt.items.map((i) => `${i.quantity}× ${i.productName}`).join(', ')}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 no-print">
+              <button
+                type="button"
+                onClick={() => window.print()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-800 bg-white dark:bg-zinc-900 text-xs font-medium text-emerald-900 dark:text-emerald-200 cursor-pointer"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span>Print Receipt</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setLastReceipt(null)}
+                className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-medium cursor-pointer"
+              >
+                Done
+              </button>
             </div>
           </div>
         )}
 
         {cart.length === 0 ? (
-          <div className="py-10 text-center border border-dashed border-stone-200 dark:border-zinc-800 rounded-xl">
+          <div className="py-10 text-center border border-dashed border-stone-200 dark:border-zinc-800 rounded-xl no-print">
             <p className="text-sm font-medium text-stone-600 dark:text-zinc-300">Basket is empty</p>
             <p className="text-xs text-stone-400 dark:text-zinc-500 mt-1">
               Click any product or scan a barcode to start checkout.
             </p>
           </div>
         ) : (
-          <div className="divide-y divide-stone-100 dark:divide-zinc-800 max-h-64 overflow-y-auto pr-1">
+          <div className="divide-y divide-stone-100 dark:divide-zinc-800 max-h-60 overflow-y-auto pr-1 no-print">
             {cart.map(({ product, quantity }) => (
               <div key={product.id} className="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-3">
                 <div className="min-w-0 flex-1">
@@ -422,7 +499,7 @@ export const PosView: React.FC<PosViewProps> = ({
         )}
 
         {/* Total Summary */}
-        <div className="pt-4 border-t border-stone-200 dark:border-zinc-800 flex items-center justify-between">
+        <div className="pt-4 border-t border-stone-200 dark:border-zinc-800 flex items-center justify-between no-print">
           <span className="text-sm font-medium text-stone-600 dark:text-zinc-400">Amount Due</span>
           <span className="text-2xl font-semibold font-mono-num text-stone-900 dark:text-zinc-50">
             {settings.currency} {cartTotal.toLocaleString()}
@@ -430,7 +507,7 @@ export const PosView: React.FC<PosViewProps> = ({
         </div>
 
         {/* Payment Mode Selector */}
-        <div className="space-y-2">
+        <div className="space-y-2 no-print">
           <p className="text-xs font-medium text-stone-600 dark:text-zinc-400">Mode of Payment</p>
           <div className="grid grid-cols-3 gap-2">
             {(
@@ -457,23 +534,136 @@ export const PosView: React.FC<PosViewProps> = ({
           </div>
         </div>
 
-        {/* M-Pesa Confirmation Message Panel */}
+        {/* M-Pesa Payment Options: STK Phone Prompt OR Confirmation SMS */}
         {paymentMode === 'Mpesa' && (
-          <MpesaMessagePanel
-            expectedAmount={cartTotal}
-            tillNumber={settings.mpesaTillNumber}
-            value={mpesaRawMsg}
-            onChange={(raw, parsed, valid) => {
-              setMpesaRawMsg(raw);
-              setMpesaParsed(parsed);
-              setMpesaValid(valid);
-            }}
-          />
+          <div className="space-y-3 no-print">
+            <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-stone-100 dark:bg-zinc-950 border border-stone-200 dark:border-zinc-800">
+              <button
+                type="button"
+                onClick={() => setMpesaFlow('prompt')}
+                className={`py-1.5 px-2.5 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                  mpesaFlow === 'prompt'
+                    ? 'bg-white dark:bg-zinc-800 text-stone-900 dark:text-zinc-100 shadow-sm'
+                    : 'text-stone-600 dark:text-zinc-400'
+                }`}
+              >
+                Send Phone Prompt
+              </button>
+              <button
+                type="button"
+                onClick={() => setMpesaFlow('sms')}
+                className={`py-1.5 px-2.5 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                  mpesaFlow === 'sms'
+                    ? 'bg-white dark:bg-zinc-800 text-stone-900 dark:text-zinc-100 shadow-sm'
+                    : 'text-stone-600 dark:text-zinc-400'
+                }`}
+              >
+                Access M-Pesa SMS
+              </button>
+            </div>
+
+            {mpesaFlow === 'prompt' ? (
+              <div className="rounded-xl border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/50 dark:bg-emerald-950/20 p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-emerald-900 dark:text-emerald-200">
+                    M-Pesa STK Prompt (Till {settings.mpesaTillNumber})
+                  </span>
+                  {stkState === 'confirmed' && mpesaParsed && (
+                    <span className="text-[11px] font-mono-num font-semibold text-emerald-700 dark:text-emerald-400">
+                      Verified · {mpesaParsed.transactionCode}
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <input
+                    type="tel"
+                    value={customerMpesaPhone}
+                    onChange={(e) => {
+                      setCustomerMpesaPhone(e.target.value);
+                      if (stkState !== 'idle') setStkState('idle');
+                    }}
+                    placeholder="Customer M-Pesa phone (07...)"
+                    className="px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
+                  />
+                  <input
+                    type="text"
+                    value={customerMpesaName}
+                    onChange={(e) => setCustomerMpesaName(e.target.value)}
+                    placeholder="Customer name (optional)"
+                    className="px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs text-stone-900 dark:text-zinc-100"
+                  />
+                </div>
+
+                {stkState === 'idle' && (
+                  <button
+                    type="button"
+                    disabled={cartTotal <= 0}
+                    onClick={handleSendStkPrompt}
+                    className="w-full py-2 px-3 rounded-lg bg-emerald-700 hover:bg-emerald-800 disabled:opacity-45 text-white text-xs font-medium flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span>
+                      Send Prompt to Phone ({settings.currency} {cartTotal.toLocaleString()})
+                    </span>
+                  </button>
+                )}
+
+                {stkState === 'sent' && (
+                  <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-3 space-y-2.5">
+                    <p className="text-xs text-amber-900 dark:text-amber-200">
+                      STK Prompt sent to <span className="font-mono-num font-semibold">{customerMpesaPhone}</span> for{' '}
+                      <span className="font-mono-num font-semibold">
+                        {settings.currency} {cartTotal.toLocaleString()}
+                      </span>
+                      . Ask customer to enter M-Pesa PIN.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={handleConfirmStkPrompt}
+                        className="flex-1 py-2 px-3 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold cursor-pointer"
+                      >
+                        Customer Entered PIN · Confirm
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setStkState('idle')}
+                        className="px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 text-xs text-stone-600 dark:text-zinc-300 cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {stkState === 'confirmed' && mpesaParsed && (
+                  <div className="rounded-lg bg-emerald-100/80 dark:bg-emerald-950/60 px-3 py-2 text-xs text-emerald-900 dark:text-emerald-200 space-y-0.5">
+                    <p className="font-semibold">
+                      M-Pesa Prompt Confirmed · Code {mpesaParsed.transactionCode}
+                    </p>
+                    <p className="text-[11px] opacity-90">{mpesaParsed.rawMessage}</p>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <MpesaMessagePanel
+                expectedAmount={cartTotal}
+                tillNumber={settings.mpesaTillNumber}
+                value={mpesaRawMsg}
+                onChange={(raw, parsed, valid) => {
+                  setMpesaRawMsg(raw);
+                  setMpesaParsed(parsed);
+                  setMpesaValid(valid);
+                }}
+              />
+            )}
+          </div>
         )}
 
         {/* Credit / Pending Details */}
         {paymentMode === 'Credit' && (
-          <div className="rounded-xl border border-amber-200 dark:border-amber-900/50 bg-amber-50/50 dark:bg-amber-950/20 p-4 space-y-3">
+          <div className="rounded-xl border border-amber-200 dark:border-amber-900/50 bg-amber-50/50 dark:bg-amber-950/20 p-4 space-y-3 no-print">
             <p className="text-xs font-semibold text-amber-900 dark:text-amber-200">
               Credit &amp; Pending Ledger Entry
             </p>
@@ -538,21 +728,156 @@ export const PosView: React.FC<PosViewProps> = ({
 
         <button
           type="button"
-          disabled={cart.length === 0 || submitting || (paymentMode === 'Mpesa' && !mpesaRawMsg.trim())}
-          onClick={() => void handleCheckout()}
-          className="w-full py-3 px-4 rounded-xl bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 dark:hover:bg-rose-600 disabled:opacity-45 disabled:cursor-not-allowed text-white text-sm font-semibold transition-colors cursor-pointer"
+          disabled={cart.length === 0 || submitting}
+          onClick={openPaymentPrompt}
+          className="w-full py-3 px-4 rounded-xl bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 dark:hover:bg-rose-600 disabled:opacity-45 disabled:cursor-not-allowed text-white text-sm font-semibold transition-colors cursor-pointer no-print"
         >
-          {submitting
-            ? 'Recording Transaction...'
-            : paymentMode === 'Mpesa'
-              ? mpesaValid
-                ? `Confirm Verified M-Pesa Sale (${settings.currency} ${cartTotal.toLocaleString()})`
-                : `Record M-Pesa Sale (${settings.currency} ${cartTotal.toLocaleString()})`
-              : paymentMode === 'Credit'
-                ? `Save to Credit & Pending (${settings.currency} ${cartTotal.toLocaleString()})`
-                : `Complete Cash Sale (${settings.currency} ${cartTotal.toLocaleString()})`}
+          Proceed to Pay ({settings.currency} {cartTotal.toLocaleString()})
         </button>
       </div>
+
+      {/* Payment Confirmation Prompt Modal */}
+      {payPromptOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-800 p-6 space-y-5 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100">
+                  Payment Confirmation Prompt
+                </h2>
+                <p className="text-xs text-stone-500 dark:text-zinc-400">
+                  {cart.reduce((s, i) => s + i.quantity, 0)} items · {paymentMode} Checkout
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPayPromptOpen(false)}
+                className="p-1.5 rounded-lg text-stone-400 hover:text-stone-700 dark:hover:text-zinc-200 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="rounded-xl bg-stone-50 dark:bg-zinc-950 border border-stone-200 dark:border-zinc-800 p-4 flex items-center justify-between">
+              <span className="text-xs font-medium text-stone-600 dark:text-zinc-400">
+                Total Amount Due
+              </span>
+              <span className="text-xl font-semibold font-mono-num text-stone-900 dark:text-zinc-50">
+                {settings.currency} {cartTotal.toLocaleString()}
+              </span>
+            </div>
+
+            {paymentMode === 'Cash' && (
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
+                    Cash Tendered ({settings.currency})
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={cashTendered}
+                    onChange={(e) => setCashTendered(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-base font-mono-num text-stone-900 dark:text-zinc-100"
+                  />
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {[cartTotal, 500, 1000, 2000, 5000].map((amt, idx) => (
+                    <button
+                      key={`${amt}-${idx}`}
+                      type="button"
+                      onClick={() => setCashTendered(String(amt))}
+                      className="px-2.5 py-1 rounded-lg border border-stone-200 dark:border-zinc-700 text-xs font-mono-num text-stone-700 dark:text-zinc-300 hover:bg-stone-100 dark:hover:bg-zinc-800 cursor-pointer"
+                    >
+                      {idx === 0 ? 'Exact' : amt.toLocaleString()}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex items-center justify-between pt-2 border-t border-stone-100 dark:border-zinc-800 text-sm">
+                  <span className="text-stone-600 dark:text-zinc-400">Change Due</span>
+                  <span className="font-semibold font-mono-num text-emerald-700 dark:text-emerald-400">
+                    {settings.currency} {changeDue.toLocaleString()}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {paymentMode === 'Mpesa' && (
+              <div className="space-y-3">
+                {mpesaRawMsg.trim() ? (
+                  <div className="rounded-xl border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/70 dark:bg-emerald-950/30 p-3.5 text-xs space-y-1">
+                    <p className="font-semibold text-emerald-900 dark:text-emerald-200">
+                      {mpesaValid ? 'M-Pesa Payment Verified' : 'M-Pesa Confirmation Attached'}
+                      {mpesaParsed?.transactionCode ? ` · ${mpesaParsed.transactionCode}` : ''}
+                    </p>
+                    <p className="text-emerald-800 dark:text-emerald-300">{mpesaRawMsg}</p>
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-amber-200 dark:border-amber-900/60 bg-amber-50/60 dark:bg-amber-950/30 p-3.5 space-y-2.5">
+                    <p className="text-xs text-amber-900 dark:text-amber-200">
+                      No M-Pesa confirmation attached yet. Send an instant STK prompt to the customer&apos;s phone:
+                    </p>
+                    <div className="flex gap-2">
+                      <input
+                        type="tel"
+                        value={customerMpesaPhone}
+                        onChange={(e) => setCustomerMpesaPhone(e.target.value)}
+                        placeholder="Customer phone (07...)"
+                        className="flex-1 px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleConfirmStkPrompt}
+                        className="px-3 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold cursor-pointer whitespace-nowrap"
+                      >
+                        Prompt &amp; Verify
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {paymentMode === 'Credit' && (
+              <div className="rounded-xl border border-amber-200 dark:border-amber-900/60 bg-amber-50/60 dark:bg-amber-950/20 p-3.5 text-xs space-y-1.5">
+                <p className="font-semibold text-amber-900 dark:text-amber-200">
+                  Creditor: {creditorName}
+                </p>
+                <p className="text-stone-600 dark:text-zinc-400 font-mono-num">
+                  Pending Day: {pendingDate} · Due: {dueDate}
+                </p>
+                <p className="text-stone-700 dark:text-zinc-300 font-mono-num">
+                  Deposit: {settings.currency} {Number(initialDeposit || 0).toLocaleString()} · Balance:{' '}
+                  {settings.currency}{' '}
+                  {Math.max(0, cartTotal - Number(initialDeposit || 0)).toLocaleString()}
+                </p>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setPayPromptOpen(false)}
+                className="px-4 py-2.5 rounded-xl border border-stone-200 dark:border-zinc-700 text-xs font-medium text-stone-700 dark:text-zinc-300 cursor-pointer"
+              >
+                Back to Basket
+              </button>
+              <button
+                type="button"
+                disabled={
+                  submitting ||
+                  (paymentMode === 'Cash' && tenderedNum < cartTotal) ||
+                  (paymentMode === 'Mpesa' && !mpesaRawMsg.trim())
+                }
+                onClick={() => void handleConfirmSale()}
+                className="px-5 py-2.5 rounded-xl bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 disabled:opacity-45 text-white text-xs font-semibold cursor-pointer"
+              >
+                {submitting ? 'Completing...' : 'Confirm & Complete Sale'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

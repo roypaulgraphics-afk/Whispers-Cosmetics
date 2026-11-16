@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ImagePlus, RefreshCw, ScanBarcode, Upload } from 'lucide-react';
+import { CheckCircle2, ImagePlus, Upload } from 'lucide-react';
 import { PRODUCT_CATEGORIES, Product, ProductCategory, StoreSettings } from '../types';
 import { PRESET_PRODUCT_IMAGES } from '../lib/defaultImages';
 import { processUploadedImage } from '../lib/imageUpload';
@@ -8,8 +8,7 @@ import { ProductThumbnail } from './ProductThumbnail';
 interface ProductFormViewProps {
   initialProduct?: Product | null;
   settings: StoreSettings;
-  onOpenScanner: (onDetected: (barcode: string) => void) => void;
-  onSubmit: (data: Omit<Product, 'id' | 'updatedAt'>) => Promise<void>;
+  onSubmit: (data: Omit<Product, 'id' | 'updatedAt'>, options?: { addAnother?: boolean }) => Promise<void>;
   onCancel?: () => void;
   submitLabel?: string;
 }
@@ -17,19 +16,12 @@ interface ProductFormViewProps {
 export const ProductFormView: React.FC<ProductFormViewProps> = ({
   initialProduct,
   settings,
-  onOpenScanner,
   onSubmit,
   onCancel,
   submitLabel = 'Save Product Listing',
 }) => {
   const [name, setName] = useState(initialProduct?.name ?? '');
   const [brand, setBrand] = useState(initialProduct?.brand ?? 'Whispers Botanicals');
-  const [sku, setSku] = useState(
-    initialProduct?.sku ?? `WC-${Math.floor(1000 + Math.random() * 9000)}`,
-  );
-  const [barcode, setBarcode] = useState(
-    initialProduct?.barcode ?? `6164001${Math.floor(100000 + Math.random() * 899999)}`,
-  );
   const [category, setCategory] = useState<ProductCategory>(
     initialProduct?.category ?? 'Lotion',
   );
@@ -50,6 +42,7 @@ export const ProductFormView: React.FC<ProductFormViewProps> = ({
   const [imageUrl, setImageUrl] = useState(initialProduct?.imageUrl ?? 'preset:lotion');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [savedNotice, setSavedNotice] = useState('');
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -63,44 +56,70 @@ export const ProductFormView: React.FC<ProductFormViewProps> = ({
     }
   };
 
-  const generateBarcode = () => {
-    const random12 = `616400${Math.floor(1000000 + Math.random() * 8999999)}`.slice(0, 13);
-    setBarcode(random12);
+  const resetForm = () => {
+    setName('');
+    setBrand('Whispers Botanicals');
+    setCategory('Lotion');
+    setCostPrice('450');
+    setBasePrice('800');
+    setCurrentPrice('800');
+    setAutoDynamicPricing(true);
+    setStock('15');
+    setReorderLevel('6');
+    setIsPerishable(true);
+    setExpiryDate(new Date(Date.now() + 180 * 86400000).toISOString().slice(0, 10));
+    setImageUrl('preset:lotion');
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const saveListing = async (addAnother = false) => {
     if (!name.trim()) {
       setError('Product name is required.');
       return;
     }
     setSaving(true);
     setError('');
+    setSavedNotice('');
     try {
-      await onSubmit({
-        name: name.trim(),
-        brand: brand.trim() || 'Whispers Cosmetics',
-        sku: sku.trim() || `WC-${Date.now().toString().slice(-4)}`,
-        barcode: barcode.trim(),
-        category,
-        costPrice: Math.max(0, Number(costPrice || 0)),
-        basePrice: Math.max(0, Number(basePrice || 0)),
-        currentPrice: Math.max(0, Number(currentPrice || basePrice || 0)),
-        autoDynamicPricing,
-        stock: Math.max(0, Math.floor(Number(stock || 0))),
-        reorderLevel: Math.max(0, Math.floor(Number(reorderLevel || 0))),
-        isPerishable,
-        expiryDate: isPerishable && expiryDate ? expiryDate : null,
-        imageUrl: imageUrl.trim(),
-      });
-      if (!initialProduct) {
-        setName('');
-        setSku(`WC-${Math.floor(1000 + Math.random() * 9000)}`);
-        generateBarcode();
+      const autoSku =
+        initialProduct?.sku ||
+        `WC-${category.slice(0, 3).toUpperCase()}-${Math.floor(100 + Math.random() * 900)}`;
+      const autoBarcode =
+        initialProduct?.barcode ||
+        `616400${Math.floor(1000000 + Math.random() * 8999999)}`.slice(0, 13);
+
+      await onSubmit(
+        {
+          name: name.trim(),
+          brand: brand.trim() || 'Whispers Cosmetics',
+          sku: autoSku,
+          barcode: autoBarcode,
+          category,
+          costPrice: Math.max(0, Number(costPrice || 0)),
+          basePrice: Math.max(0, Number(basePrice || 0)),
+          currentPrice: Math.max(0, Number(currentPrice || basePrice || 0)),
+          autoDynamicPricing,
+          stock: Math.max(0, Math.floor(Number(stock || 0))),
+          reorderLevel: Math.max(0, Math.floor(Number(reorderLevel || 0))),
+          isPerishable,
+          expiryDate: isPerishable && expiryDate ? expiryDate : null,
+          imageUrl: imageUrl.trim(),
+        },
+        { addAnother },
+      );
+
+      if (!initialProduct && addAnother) {
+        const addedName = name.trim();
+        resetForm();
+        setSavedNotice(`"${addedName}" added to inventory. Ready for your next listing.`);
       }
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await saveListing(false);
   };
 
   const margin = Number(currentPrice || 0) - Number(costPrice || 0);
@@ -115,12 +134,19 @@ export const ProductFormView: React.FC<ProductFormViewProps> = ({
         </div>
       )}
 
+      {savedNotice && (
+        <div className="px-4 py-2.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-900/60 text-xs font-medium text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
+          <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-700 dark:text-emerald-400" />
+          <span>{savedNotice}</span>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Product Image Upload & Studio Presets */}
+        {/* Step 1: Product Image Upload & Studio Presets */}
         <div className="lg:col-span-4 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4">
           <h3 className="text-sm font-semibold text-stone-900 dark:text-zinc-100 flex items-center gap-2">
             <ImagePlus className="w-4 h-4 text-rose-900 dark:text-rose-400" />
-            <span>Product Image</span>
+            <span>01. Product Photo</span>
           </h3>
 
           <div className="flex justify-center">
@@ -180,208 +206,181 @@ export const ProductFormView: React.FC<ProductFormViewProps> = ({
           </div>
         </div>
 
-        {/* Product Details, Pricing & Perishables */}
+        {/* Step 2-4: Product Details, Pricing, Stock & Perishables */}
         <div className="lg:col-span-8 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6 space-y-5">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="sm:col-span-2">
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                Product Name *
-              </label>
-              <input
-                type="text"
-                required
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="e.g. Cocoa & Almond Silk Body Lotion 400ml"
-                className="w-full px-3.5 py-2.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm text-stone-900 dark:text-zinc-100"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                Category *
-              </label>
-              <select
-                value={category}
-                onChange={(e) => setCategory(e.target.value as ProductCategory)}
-                className="w-full px-3.5 py-2.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm text-stone-900 dark:text-zinc-100"
-              >
-                {PRODUCT_CATEGORIES.map((cat) => (
-                  <option key={cat} value={cat}>
-                    {cat}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                Brand / Supplier
-              </label>
-              <input
-                type="text"
-                value={brand}
-                onChange={(e) => setBrand(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm text-stone-900 dark:text-zinc-100"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                SKU Code
-              </label>
-              <input
-                type="text"
-                value={sku}
-                onChange={(e) => setSku(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                Barcode (EAN-13 / UPC)
-              </label>
-              <div className="flex gap-1.5">
+          <div>
+            <h3 className="text-sm font-semibold text-stone-900 dark:text-zinc-100 mb-3">
+              02. Product Details &amp; Category
+            </h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
+                  Product Name *
+                </label>
                 <input
                   type="text"
-                  value={barcode}
-                  onChange={(e) => setBarcode(e.target.value)}
-                  className="flex-1 px-3 py-2.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
+                  required
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="e.g. Cocoa & Almond Silk Body Lotion 400ml"
+                  className="w-full px-3.5 py-2.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm text-stone-900 dark:text-zinc-100"
                 />
-                <button
-                  type="button"
-                  onClick={() => onOpenScanner((code) => setBarcode(code))}
-                  title="Scan Barcode"
-                  className="px-3 rounded-lg border border-stone-200 dark:border-zinc-700 hover:bg-stone-100 dark:hover:bg-zinc-800 text-stone-700 dark:text-zinc-300 cursor-pointer"
-                >
-                  <ScanBarcode className="w-4 h-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={generateBarcode}
-                  title="Generate New Barcode"
-                  className="px-3 rounded-lg border border-stone-200 dark:border-zinc-700 hover:bg-stone-100 dark:hover:bg-zinc-800 text-stone-700 dark:text-zinc-300 cursor-pointer"
-                >
-                  <RefreshCw className="w-4 h-4" />
-                </button>
               </div>
-            </div>
-          </div>
 
-          {/* Pricing & Stock */}
-          <div className="pt-4 border-t border-stone-100 dark:border-zinc-800 grid grid-cols-2 sm:grid-cols-5 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                Cost ({settings.currency})
-              </label>
-              <input
-                type="number"
-                min={0}
-                value={costPrice}
-                onChange={(e) => setCostPrice(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
-              />
-            </div>
+              <div>
+                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
+                  Category *
+                </label>
+                <select
+                  value={category}
+                  onChange={(e) => setCategory(e.target.value as ProductCategory)}
+                  className="w-full px-3.5 py-2.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm text-stone-900 dark:text-zinc-100"
+                >
+                  {PRODUCT_CATEGORIES.map((cat) => (
+                    <option key={cat} value={cat}>
+                      {cat}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                Base Price
-              </label>
-              <input
-                type="number"
-                min={0}
-                value={basePrice}
-                onChange={(e) => {
-                  setBasePrice(e.target.value);
-                  if (!initialProduct) setCurrentPrice(e.target.value);
-                }}
-                className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                Active Price
-              </label>
-              <input
-                type="number"
-                min={0}
-                value={currentPrice}
-                onChange={(e) => setCurrentPrice(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num font-semibold text-rose-900 dark:text-rose-400"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                Stock Qty
-              </label>
-              <input
-                type="number"
-                min={0}
-                value={stock}
-                onChange={(e) => setStock(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
-                Reorder At
-              </label>
-              <input
-                type="number"
-                min={0}
-                value={reorderLevel}
-                onChange={(e) => setReorderLevel(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
-              />
-            </div>
-          </div>
-
-          {/* Margin preview + Dynamic Pricing & Perishable options */}
-          <div className="flex flex-wrap items-center justify-between gap-4 pt-2">
-            <div className="text-xs font-mono-num text-stone-500 dark:text-zinc-400">
-              Unit Margin: {settings.currency} {margin.toLocaleString()} ({marginPct}%)
-            </div>
-
-            <label className="inline-flex items-center gap-2 text-xs font-medium text-stone-700 dark:text-zinc-300 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={autoDynamicPricing}
-                onChange={(e) => setAutoDynamicPricing(e.target.checked)}
-                className="rounded border-stone-300 text-rose-900 focus:ring-rose-800"
-              />
-              <span>Enable demand-based dynamic price adjustments</span>
-            </label>
-          </div>
-
-          <div className="pt-4 border-t border-stone-100 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-4">
-            <label className="inline-flex items-center gap-2 text-xs font-medium text-stone-700 dark:text-zinc-300 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={isPerishable}
-                onChange={(e) => setIsPerishable(e.target.checked)}
-                className="rounded border-stone-300 text-rose-900 focus:ring-rose-800"
-              />
-              <span>Perishable item (track expiration date)</span>
-            </label>
-
-            {isPerishable && (
-              <div className="flex items-center gap-2">
-                <label className="text-xs text-stone-500 dark:text-zinc-400">Expiry Date:</label>
+              <div>
+                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
+                  Brand / Supplier
+                </label>
                 <input
-                  type="date"
-                  value={expiryDate}
-                  onChange={(e) => setExpiryDate(e.target.value)}
-                  className="px-3 py-1.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
+                  type="text"
+                  value={brand}
+                  onChange={(e) => setBrand(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm text-stone-900 dark:text-zinc-100"
                 />
               </div>
-            )}
+            </div>
           </div>
 
-          <div className="pt-4 flex items-center justify-end gap-3">
+          {/* Step 3: Pricing & Stock */}
+          <div className="pt-4 border-t border-stone-100 dark:border-zinc-800 space-y-3">
+            <h3 className="text-sm font-semibold text-stone-900 dark:text-zinc-100">
+              03. Pricing &amp; Stock Levels
+            </h3>
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
+                  Cost ({settings.currency})
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={costPrice}
+                  onChange={(e) => setCostPrice(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
+                  Base Price
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={basePrice}
+                  onChange={(e) => {
+                    setBasePrice(e.target.value);
+                    if (!initialProduct) setCurrentPrice(e.target.value);
+                  }}
+                  className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
+                  Active Price
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={currentPrice}
+                  onChange={(e) => setCurrentPrice(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num font-semibold text-rose-900 dark:text-rose-400"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
+                  Stock Qty
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={stock}
+                  onChange={(e) => setStock(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1.5">
+                  Reorder At
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={reorderLevel}
+                  onChange={(e) => setReorderLevel(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-4 pt-1">
+              <div className="text-xs font-mono-num text-stone-500 dark:text-zinc-400">
+                Unit Margin: {settings.currency} {margin.toLocaleString()} ({marginPct}%)
+              </div>
+
+              <label className="inline-flex items-center gap-2 text-xs font-medium text-stone-700 dark:text-zinc-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={autoDynamicPricing}
+                  onChange={(e) => setAutoDynamicPricing(e.target.checked)}
+                  className="rounded border-stone-300 text-rose-900 focus:ring-rose-800"
+                />
+                <span>Enable demand-based dynamic price adjustments</span>
+              </label>
+            </div>
+          </div>
+
+          {/* Step 4: Perishability */}
+          <div className="pt-4 border-t border-stone-100 dark:border-zinc-800 space-y-3">
+            <h3 className="text-sm font-semibold text-stone-900 dark:text-zinc-100">
+              04. Perishable Shelf Life
+            </h3>
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <label className="inline-flex items-center gap-2 text-xs font-medium text-stone-700 dark:text-zinc-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={isPerishable}
+                  onChange={(e) => setIsPerishable(e.target.checked)}
+                  className="rounded border-stone-300 text-rose-900 focus:ring-rose-800"
+                />
+                <span>Perishable item (track expiration date)</span>
+              </label>
+
+              {isPerishable && (
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-stone-500 dark:text-zinc-400">Expiry Date:</label>
+                  <input
+                    type="date"
+                    value={expiryDate}
+                    onChange={(e) => setExpiryDate(e.target.value)}
+                    className="px-3 py-1.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="pt-4 border-t border-stone-100 dark:border-zinc-800 flex flex-wrap items-center justify-end gap-3">
             {onCancel && (
               <button
                 type="button"
@@ -389,6 +388,16 @@ export const ProductFormView: React.FC<ProductFormViewProps> = ({
                 className="px-4 py-2.5 rounded-xl border border-stone-200 dark:border-zinc-700 text-xs font-medium text-stone-700 dark:text-zinc-300 hover:bg-stone-100 dark:hover:bg-zinc-800 transition-colors cursor-pointer"
               >
                 Cancel
+              </button>
+            )}
+            {!initialProduct && (
+              <button
+                type="button"
+                disabled={saving}
+                onClick={() => void saveListing(true)}
+                className="px-4 py-2.5 rounded-xl border border-stone-300 dark:border-zinc-700 hover:bg-stone-100 dark:hover:bg-zinc-800 text-stone-800 dark:text-zinc-200 text-xs font-semibold transition-colors cursor-pointer disabled:opacity-50"
+              >
+                Save &amp; Add Another
               </button>
             )}
             <button

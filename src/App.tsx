@@ -124,7 +124,10 @@ export default function App() {
     void handleSaveSettings({ theme: next });
   };
 
-  const handleCreateProduct = async (payload: Omit<Product, 'id' | 'updatedAt'>) => {
+  const handleCreateProduct = async (
+    payload: Omit<Product, 'id' | 'updatedAt'>,
+    options?: { addAnother?: boolean },
+  ) => {
     const res = await fetch('/api/products', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -134,7 +137,9 @@ export default function App() {
       const created = (await res.json()) as Product;
       setDb((prev) => (prev ? { ...prev, products: [created, ...prev.products] } : prev));
       showToast(`Added "${created.name}" to inventory.`);
-      setActiveTab('inventory');
+      if (!options?.addAnother) {
+        setActiveTab('inventory');
+      }
     }
   };
 
@@ -492,7 +497,6 @@ export default function App() {
               products={db.products}
               transactions={db.transactions}
               settings={db.settings}
-              onOpenScanner={openScanner}
               onUpdateProduct={handleUpdateProduct}
               onDeleteProduct={handleDeleteProduct}
               onGoToAddProduct={() => setActiveTab('add-product')}
@@ -506,13 +510,12 @@ export default function App() {
                   Add New Cosmetic Product or Listing
                 </h2>
                 <p className="text-xs text-stone-500 dark:text-zinc-400 mt-0.5">
-                  Assign category, upload product photography, set perishable expiration dates, and enable dynamic demand pricing.
+                  Follow the 4 steps below to upload product photography, assign category, set stock &amp; pricing, and track expiration dates.
                 </p>
               </div>
               <ProductFormView
                 settings={db.settings}
-                onOpenScanner={openScanner}
-                submitLabel="Add Product to Inventory"
+                submitLabel="Save & View Inventory"
                 onSubmit={handleCreateProduct}
               />
             </div>

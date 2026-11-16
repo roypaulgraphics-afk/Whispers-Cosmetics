@@ -4,7 +4,6 @@ import {
   Check,
   Edit3,
   Plus,
-  ScanBarcode,
   Search,
   Trash2,
   TrendingUp,
@@ -25,7 +24,6 @@ interface InventoryViewProps {
   products: Product[];
   transactions: SaleTransaction[];
   settings: StoreSettings;
-  onOpenScanner: (onDetected: (barcode: string) => void) => void;
   onUpdateProduct: (id: string, data: Partial<Product>) => Promise<void>;
   onDeleteProduct: (id: string) => Promise<void>;
   onGoToAddProduct: () => void;
@@ -37,7 +35,6 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   products,
   transactions,
   settings,
-  onOpenScanner,
   onUpdateProduct,
   onDeleteProduct,
   onGoToAddProduct,
@@ -70,8 +67,6 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
         const hit =
           product.name.toLowerCase().includes(q) ||
           product.brand.toLowerCase().includes(q) ||
-          product.sku.toLowerCase().includes(q) ||
-          product.barcode.toLowerCase().includes(q) ||
           product.category.toLowerCase().includes(q);
         if (!hit) return false;
       }
@@ -97,19 +92,10 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Filter by product, brand, SKU, or barcode..."
+              placeholder="Search by product name, brand, or category..."
               className="w-full pl-10 pr-4 py-2 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-sm text-stone-900 dark:text-zinc-100 placeholder:text-stone-400"
             />
           </div>
-
-          <button
-            type="button"
-            onClick={() => onOpenScanner((code) => setSearch(code))}
-            className="inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:bg-stone-100 dark:hover:bg-zinc-800 text-xs font-medium text-stone-800 dark:text-zinc-200 transition-colors cursor-pointer whitespace-nowrap"
-          >
-            <ScanBarcode className="w-4 h-4" />
-            <span>Scan to Find</span>
-          </button>
 
           <select
             value={categoryFilter}
@@ -178,7 +164,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="border-b border-stone-200 dark:border-zinc-800 text-[11px] font-semibold text-stone-500 dark:text-zinc-400 bg-stone-50/80 dark:bg-zinc-950/40">
-                <th className="py-3 px-4">Product &amp; Barcode</th>
+                <th className="py-3 px-4">Product</th>
                 <th className="py-3 px-4">Category</th>
                 <th className="py-3 px-4 text-right">Stock / Reorder</th>
                 <th className="py-3 px-4">Perishable / Expiry</th>
@@ -212,8 +198,8 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                           <p className="font-medium text-stone-900 dark:text-zinc-100 truncate max-w-[230px]">
                             {product.name}
                           </p>
-                          <p className="text-[11px] text-stone-500 dark:text-zinc-400 font-mono-num">
-                            {product.sku} · {product.barcode}
+                          <p className="text-[11px] text-stone-500 dark:text-zinc-400">
+                            {product.brand}
                           </p>
                         </div>
                       </div>
@@ -378,7 +364,6 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
             <ProductFormView
               initialProduct={editingProduct}
               settings={settings}
-              onOpenScanner={onOpenScanner}
               submitLabel="Save Changes"
               onCancel={() => setEditingProduct(null)}
               onSubmit={async (data) => {

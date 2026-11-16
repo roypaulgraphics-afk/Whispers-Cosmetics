@@ -1,5 +1,6 @@
 import express from 'express';
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import type {
@@ -727,25 +728,47 @@ async function startServer() {
     res.json(db.settings);
   });
 
+  const PORT = 3000;
+  const httpServer = http.createServer(app);
+
   if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+    const vitePromise = import('vite').then(({ createServer: createViteServer }) =>
+      createViteServer({
+        server: {
+          middlewareMode: true,
+          hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+        },
+        appType: 'spa',
+      }),
+    );
+
+    app.use(async (req, res, next) => {
+      try {
+        const vite = await vitePromise;
+        vite.middlewares(req, res, next);
+      } catch (err) {
+        next(err);
+      }
     });
-    app.use(vite.middlewares);
+
+    httpServer.listen(PORT, '0.0.0.0', () => {
+      console.log(`Whispers Cosmetics server listening on http://localhost:${PORT}`);
+    });
+    await vitePromise;
   } else {
     const distPath = path.join(__dirname, 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
-  }
 
-  const PORT = 3000;
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Whispers Cosmetics server listening on http://localhost:${PORT}`);
-  });
+    httpServer.listen(PORT, '0.0.0.0', () => {
+      console.log(`Whispers Cosmetics server listening on http://localhost:${PORT}`);
+    });
+  }
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Failed to start Whispers Cosmetics server:', err);
+  process.exit(1);
+});
