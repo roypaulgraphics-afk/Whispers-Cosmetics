@@ -1,8 +1,28 @@
 node_modules/
-build/
 dist/
+dist-server/
+build/
 coverage/
 .DS_Store
 *.log
 .env*
 !.env.example
+
+# Runtime data: SQLite database, WAL files, uploads and backups
+data/*
+!data/whispers_db.json
+data-devtest/
+*.db
+*.db-shm
+*.db-wal
+
+# Android build output (the generated project itself is tracked)
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.apk
+*.aab
+*.jks
+*.keystore

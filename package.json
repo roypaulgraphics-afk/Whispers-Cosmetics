@@ -1,37 +1,46 @@
 {
-  "name": "react-example",
+  "name": "whispers-cosmetics",
+  "productName": "Whispers Cosmetics",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "description": "Cosmetics POS and inventory system: barcode sales, M-Pesa, refunds, credits, stock ledger and reports.",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
-    "start": "NODE_ENV=production tsx server.ts",
-    "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "build": "vite build && npm run build:server",
+    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=dist-server/server.js",
+    "start": "node dist-server/server.js --production",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/refunds.test.ts tests/mpesaParser.test.ts tests/server.test.ts",
+    "lint": "npm run typecheck",
+    "clean": "node -e \"const fs=require('fs');for(const p of ['dist','dist-server','coverage'])fs.rmSync(p,{recursive:true,force:true})\"",
+    "mobile:sync": "cap sync android",
+    "mobile:open": "cap open android"
   },
   "dependencies": {
-    "@google/genai": "^2.4.0",
-    "@tailwindcss/vite": "^4.3.3",
-    "@vitejs/plugin-react": "^6.1.1",
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/core": "^8.6.2",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "react": "^19.0.1",
-    "react-dom": "^19.0.1",
-    "vite": "^8.3.0",
-    "express": "^4.21.2",
-    "dotenv": "^17.2.3",
-    "motion": "^12.23.24"
+    "react-dom": "^19.0.1"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.6.2",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "esbuild": "^0.28.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
-    "@types/express": "^4.17.21"
+    "vite": "^8.3.0"
+  },
+  "engines": {
+    "node": ">=24.0.0"
   }
 }

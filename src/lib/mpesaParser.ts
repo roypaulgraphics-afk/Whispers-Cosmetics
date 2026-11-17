@@ -30,9 +30,20 @@ export function parseMpesaMessage(rawMessage: string, expectedAmount?: number): 
     };
   }
 
-  // Extract 10-character alphanumeric M-Pesa code (usually starts with letter, uppercase)
-  const codeMatch = trimmed.match(/\b([A-Z0-9]{9,12})\b(?=\s+Confirmed\.?)/i) || trimmed.match(/^([A-Z0-9]{8,12})\b/i);
-  const transactionCode = codeMatch ? codeMatch[1].toUpperCase() : '';
+  // Extract an 8-12 character M-Pesa code. Real codes mix letters and digits,
+  // so reject all-letter words like "Confirmed" that can sit at the start.
+  const codeCandidates = [
+    trimmed.match(/\b([A-Z0-9]{9,12})\b(?=\s+Confirmed\.?)/i),
+    trimmed.match(/^([A-Z0-9]{8,12})\b/i),
+  ];
+  let transactionCode = '';
+  for (const candidate of codeCandidates) {
+    const value = candidate?.[1]?.toUpperCase() ?? '';
+    if (value && /\d/.test(value) && !/^CONFIRMED$/.test(value)) {
+      transactionCode = value;
+      break;
+    }
+  }
 
   // Extract amount in Ksh / KES
   const amountMatch = trimmed.match(/(?:Ksh|KES)\.?\s*([\d,]+(?:\.\d{1,2})?)/i);
@@ -92,9 +103,10 @@ export function parseMpesaMessage(rawMessage: string, expectedAmount?: number): 
 export function generateSimulatedMpesaSms(amount: number, tillNumber = '5482910', sender = 'FAITH MUTISO', phone = '0724819302'): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = 'UK';
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 7; i += 1) {
     code += chars[Math.floor(Math.random() * chars.length)];
   }
+  code += String(Math.floor(Math.random() * 10));
   const now = new Date();
   const dd = String(now.getDate()).padStart(2, '0');
   const mm = String(now.getMonth() + 1).padStart(2, '0');

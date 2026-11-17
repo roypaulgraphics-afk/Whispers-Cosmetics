@@ -1,0 +1,15 @@
+node_modules
+dist
+dist-server
+coverage
+.git
+.github
+android
+tests
+*.log
+.env
+.env.*
+!.env.example
+README.md
+data/*
+!data/whispers_db.json

@@ -1,6 +1,11 @@
-import { CreditRecord, CreditStatus, Product, SaleTransaction } from '../types';
+import { CreditRecord, CreditStatus, Product } from '../types';
 
 export type DemandTier = 'High Demand' | 'Steady' | 'Slow Moving' | 'Near Expiry';
+
+export interface SaleHistoryLike {
+  createdAt: string;
+  items: Array<{ productId: string; quantity: number }>;
+}
 
 export interface DynamicPriceRecommendation {
   productId: string;
@@ -39,7 +44,7 @@ export function getExpiryStatus(product: Product): {
 
 export function computeDynamicRecommendation(
   product: Product,
-  transactions: SaleTransaction[],
+  transactions: SaleHistoryLike[],
 ): DynamicPriceRecommendation {
   const now = Date.now();
   const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;

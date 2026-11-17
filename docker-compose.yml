@@ -1,0 +1,16 @@
+services:
+  whispers-pos:
+    build: .
+    image: whispers-cosmetics:latest
+    container_name: whispers-pos
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      HOST: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/data

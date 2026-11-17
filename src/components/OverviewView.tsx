@@ -1,373 +1,402 @@
-import React from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
-  Clock,
-  Flame,
-  PackagePlus,
+  CalendarClock,
+  CircleDollarSign,
+  CreditCard,
+  Package,
+  ShoppingCart,
   TrendingUp,
+  Wallet,
 } from 'lucide-react';
-import { CreditRecord, Product, SaleTransaction, StoreSettings } from '../types';
-import {
-  computeCreditStatus,
-  computeDynamicRecommendation,
-  getExpiryStatus,
-} from '../lib/dynamicPricing';
-import { ProductThumbnail } from './ProductThumbnail';
+import type { BootstrapData } from '../types';
+import type { DynamicPriceRecommendation } from '../lib/dynamicPricing';
+import { api } from '../lib/api';
+import { Badge, EmptyState, SectionHeading, Spinner, StatCard } from './ui';
+import { cn, dateOnly, money, percent, timeOnly } from '../lib/format';
 
 interface OverviewViewProps {
-  products: Product[];
-  transactions: SaleTransaction[];
-  credits: CreditRecord[];
-  settings: StoreSettings;
-  onNavigate: (tab: 'pos' | 'inventory' | 'add-product' | 'credits' | 'reports') => void;
-  onApplyDynamicPrice: (productId: string, newPrice: number) => Promise<void>;
-  onQuickRestock: (productId: string, addQty: number) => Promise<void>;
+  data: BootstrapData;
+  onNavigate: (route: string) => void;
+  onRefresh: () => Promise<void>;
+  showToast: (message: string, kind?: 'success' | 'error' | 'info') => void;
 }
 
-export const OverviewView: React.FC<OverviewViewProps> = ({
-  products,
-  transactions,
-  credits,
-  settings,
-  onNavigate,
-  onApplyDynamicPrice,
-  onQuickRestock,
-}) => {
-  const todayKey = new Date().toISOString().slice(0, 10);
-  const todayTransactions = transactions.filter((tx) => tx.createdAt.slice(0, 10) === todayKey);
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-  const todayRevenue = todayTransactions.reduce((sum, tx) => sum + tx.totalAmount, 0);
-  const todayCash = todayTransactions
-    .filter((tx) => tx.paymentMode === 'Cash')
-    .reduce((sum, tx) => sum + tx.totalAmount, 0);
-  const todayMpesa = todayTransactions
-    .filter((tx) => tx.paymentMode === 'Mpesa')
-    .reduce((sum, tx) => sum + tx.totalAmount, 0);
+export const OverviewView: React.FC<OverviewViewProps> = ({ data, onNavigate, onRefresh, showToast }) => {
+  const { overview, settings, meta } = data;
+  const currency = settings.currency;
+  const [recommendations, setRecommendations] = useState<DynamicPriceRecommendation[]>([]);
+  const [loadingPricing, setLoadingPricing] = useState(true);
+  const [applying, setApplying] = useState<string | null>(null);
 
-  const lowStockItems = products.filter((p) => p.stock <= p.reorderLevel);
-  const expiryAlerts = products.filter((p) => {
-    const exp = getExpiryStatus(p);
-    return exp.level === 'soon' || exp.level === 'expired';
-  });
+  const loadPricing = useCallback(async () => {
+    setLoadingPricing(true);
+    try {
+      const result = await api<{ recommendations: DynamicPriceRecommendation[] }>('/api/pricing');
+      setRecommendations(result.recommendations);
+    } catch {
+      setRecommendations([]);
+    } finally {
+      setLoadingPricing(false);
+    }
+  }, []);
 
-  const outstandingCredits = credits.filter((c) => computeCreditStatus(c) !== 'Paid');
-  const totalCreditOwed = outstandingCredits.reduce(
-    (sum, c) => sum + Math.max(0, c.totalAmount - c.amountPaid),
-    0,
+  useEffect(() => {
+    void loadPricing();
+  }, [loadPricing]);
+
+  const dailyMax = useMemo(
+    () => Math.max(1, ...overview.daily.map((point) => Math.max(point.sales, point.refunds))),
+    [overview.daily],
   );
 
-  // Daily popular products (rank by today's units, falling back to 7-day volume)
-  const productSalesMap = new Map<
-    string,
-    { product: Product; todayUnits: number; totalUnits: number; revenueToday: number }
-  >();
-  for (const p of products) {
-    productSalesMap.set(p.id, { product: p, todayUnits: 0, totalUnits: 0, revenueToday: 0 });
-  }
-  for (const tx of transactions) {
-    const isToday = tx.createdAt.slice(0, 10) === todayKey;
-    for (const item of tx.items) {
-      const entry = productSalesMap.get(item.productId);
-      if (entry) {
-        entry.totalUnits += item.quantity;
-        if (isToday) {
-          entry.todayUnits += item.quantity;
-          entry.revenueToday += item.quantity * item.unitPrice;
-        }
-      }
+  const productNames = useMemo(
+    () => new Map(data.products.map((product) => [product.id, product.name])),
+    [data.products],
+  );
+
+  const applyRecommendation = async (rec: DynamicPriceRecommendation) => {
+    setApplying(rec.productId);
+    try {
+      await api(`/api/products/${rec.productId}`, {
+        method: 'PATCH',
+        body: { currentPrice: rec.suggestedPrice },
+      });
+      await onRefresh();
+      await loadPricing();
+      showToast(`Price updated to ${money(rec.suggestedPrice, currency)}.`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not update price.', 'error');
+    } finally {
+      setApplying(null);
     }
-  }
+  };
 
-  const popularProducts = Array.from(productSalesMap.values())
-    .sort((a, b) => b.todayUnits - a.todayUnits || b.totalUnits - a.totalUnits)
-    .slice(0, 5);
-
-  const dynamicSuggestions = products
-    .map((p) => ({ product: p, rec: computeDynamicRecommendation(p, transactions) }))
-    .filter((item) => item.rec.needsAdjustment)
-    .slice(0, 5);
+  const todayChange =
+    overview.yesterday.netSales > 0
+      ? ((overview.today.netSales - overview.yesterday.netSales) / overview.yesterday.netSales) * 100
+      : null;
 
   return (
-    <div className="space-y-8">
-      {/* KPI Strip */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">Today&apos;s Revenue</p>
-          <p className="mt-2 text-2xl font-semibold font-mono-num text-stone-900 dark:text-zinc-50">
-            {settings.currency} {todayRevenue.toLocaleString()}
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="text-xs uppercase tracking-[0.18em] text-stone-400 dark:text-zinc-500">
+            {meta.today ? dateOnly(meta.today) : 'Today'} · {settings.storeName}
           </p>
-          <p className="mt-1.5 text-xs text-stone-500 dark:text-zinc-400 tabular-nums">
-            Cash {settings.currency} {todayCash.toLocaleString()} · M-Pesa {settings.currency}{' '}
-            {todayMpesa.toLocaleString()}
+          <h2 className="font-display text-3xl font-semibold mt-1">Store overview</h2>
+          <p className="text-sm text-stone-500 dark:text-zinc-400 mt-1">
+            Today at a glance, plus what needs attention in the store.
           </p>
         </div>
-
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">Reorder Alerts</p>
-          <p
-            className={`mt-2 text-2xl font-semibold font-mono-num ${
-              lowStockItems.length > 0
-                ? 'text-amber-600 dark:text-amber-400'
-                : 'text-emerald-600 dark:text-emerald-400'
-            }`}
-          >
-            {lowStockItems.length} items
-          </p>
-          <p className="mt-1.5 text-xs text-stone-500 dark:text-zinc-400">
-            At or below reorder threshold
-          </p>
-        </div>
-
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">Perishable Watch</p>
-          <p
-            className={`mt-2 text-2xl font-semibold font-mono-num ${
-              expiryAlerts.length > 0
-                ? 'text-red-600 dark:text-red-400'
-                : 'text-emerald-600 dark:text-emerald-400'
-            }`}
-          >
-            {expiryAlerts.length} items
-          </p>
-          <p className="mt-1.5 text-xs text-stone-500 dark:text-zinc-400">
-            Expired or expiring within 30 days
-          </p>
-        </div>
-
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">
-            Credit &amp; Pending Balance
-          </p>
-          <p className="mt-2 text-2xl font-semibold font-mono-num text-stone-900 dark:text-zinc-50">
-            {settings.currency} {totalCreditOwed.toLocaleString()}
-          </p>
-          <p className="mt-1.5 text-xs text-stone-500 dark:text-zinc-400">
-            {outstandingCredits.length} active creditor accounts
-          </p>
-        </div>
+        <button
+          type="button"
+          onClick={() => onNavigate('pos')}
+          className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-rose-900 hover:bg-rose-950 text-white text-sm font-semibold shadow-sm cursor-pointer"
+        >
+          <ShoppingCart className="w-4 h-4" /> Open register
+        </button>
       </div>
 
-      {/* Main 2-column operational panels */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Daily Popular Products */}
-        <section className="lg:col-span-7 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-          <div className="flex items-center justify-between gap-4 mb-5">
-            <div>
-              <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100 flex items-center gap-2">
-                <Flame className="w-4 h-4 text-rose-900 dark:text-rose-400" />
-                <span>Popular Products Today</span>
-              </h2>
-              <p className="text-xs text-stone-500 dark:text-zinc-400 mt-0.5">
-                Ranked by daily unit velocity across Cash, M-Pesa, and Credit sales
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => onNavigate('reports')}
-              className="inline-flex items-center gap-1 text-xs font-medium text-rose-900 dark:text-rose-400 hover:underline cursor-pointer whitespace-nowrap"
-            >
-              <span>Full Report</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          </div>
+      <div className="grid grid-cols-2 xl:grid-cols-4 gap-3">
+        <StatCard
+          label="Today's sales"
+          value={money(overview.today.netSales, currency)}
+          sub={
+            todayChange === null
+              ? `${overview.today.salesCount} transaction(s)`
+              : `${percent(todayChange)} vs yesterday`
+          }
+          icon={<Wallet className="w-4 h-4" />}
+          accent="rose"
+        />
+        <StatCard
+          label="Transactions"
+          value={String(overview.today.salesCount)}
+          sub={`Avg ${money(overview.today.averageSale, currency)}`}
+          icon={<ShoppingCart className="w-4 h-4" />}
+          accent="sky"
+        />
+        <StatCard
+          label="Gross profit today"
+          value={money(overview.today.grossProfit, currency)}
+          sub={`After ${money(overview.today.refunds, currency)} refunds`}
+          icon={<TrendingUp className="w-4 h-4" />}
+          accent="emerald"
+        />
+        <StatCard
+          label="Credit outstanding"
+          value={money(overview.outstandingCredit, currency)}
+          sub={`${overview.activeCredits} open credit account(s)`}
+          icon={<CreditCard className="w-4 h-4" />}
+          accent="amber"
+        />
+      </div>
 
-          <div className="divide-y divide-stone-100 dark:divide-zinc-800">
-            {popularProducts.map(({ product, todayUnits, totalUnits, revenueToday }, idx) => (
-              <div key={product.id} className="py-3 first:pt-0 last:pb-0 flex items-center gap-3.5">
-                <span className="w-5 text-xs font-mono-num text-stone-400 dark:text-zinc-500 shrink-0">
-                  0{idx + 1}
-                </span>
-                <ProductThumbnail
-                  imageUrl={product.imageUrl}
-                  name={product.name}
-                  category={product.category}
-                  className="w-11 h-11 rounded-lg"
-                />
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium text-stone-900 dark:text-zinc-100 truncate">
-                    {product.name}
-                  </p>
-                  <p className="text-xs text-stone-500 dark:text-zinc-400">
-                    {product.category} · {product.stock} in stock
-                  </p>
+      <div className="grid lg:grid-cols-3 gap-4">
+        <section className="lg:col-span-2 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+          <SectionHeading
+            title="Last 7 days"
+            description={`${money(overview.last7.netSales, currency)} net · ${overview.last7.salesCount} sales`}
+            action={
+              <button
+                type="button"
+                onClick={() => onNavigate('reports')}
+                className="text-xs font-medium text-rose-900 dark:text-rose-400 inline-flex items-center gap-1 cursor-pointer"
+              >
+                Full reports <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            }
+          />
+          <div className="h-44 flex items-end gap-2 sm:gap-3">
+            {overview.daily.map((point) => {
+              const day = WEEKDAYS[new Date(`${point.date}T12:00:00Z`).getUTCDay()];
+              const height = Math.max(4, Math.round((point.sales / dailyMax) * 140));
+              return (
+                <div key={point.date} className="flex-1 flex flex-col items-center gap-2 min-w-0">
+                  <div className="w-full h-36 flex items-end justify-center">
+                    <div
+                      className="w-full max-w-10 rounded-t-md bg-gradient-to-t from-rose-900 to-rose-700/80 dark:from-rose-800 dark:to-rose-600/80 relative group"
+                      style={{ height }}
+                      title={`${money(point.sales, currency)} · ${point.transactions} sale(s)`}
+                    >
+                      {point.refunds > 0 && (
+                        <span
+                          className="absolute bottom-0 inset-x-0 bg-amber-500/80 rounded-t-sm"
+                          style={{ height: Math.max(2, Math.round((point.refunds / dailyMax) * 140)) }}
+                        />
+                      )}
+                    </div>
+                  </div>
+                  <span className="text-[10px] text-stone-500 dark:text-zinc-400">{day}</span>
+                  <span className="text-[9px] font-mono text-stone-400 dark:text-zinc-500 truncate max-w-full">
+                    {point.sales > 0 ? Math.round(point.sales).toLocaleString() : '—'}
+                  </span>
                 </div>
-                <div className="text-right shrink-0">
-                  <p className="text-sm font-semibold font-mono-num text-stone-900 dark:text-zinc-100">
-                    {todayUnits} sold today
-                  </p>
-                  <p className="text-xs font-mono-num text-stone-500 dark:text-zinc-400">
-                    {revenueToday > 0
-                      ? `${settings.currency} ${revenueToday.toLocaleString()}`
-                      : `${totalUnits} this week`}
-                  </p>
-                </div>
-              </div>
-            ))}
+              );
+            })}
+          </div>
+          <div className="flex items-center gap-4 mt-4 pt-3 border-t border-stone-100 dark:border-zinc-800 text-[11px] text-stone-500 dark:text-zinc-400">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-sm bg-rose-800" /> Sales
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-sm bg-amber-500" /> Refunds
+            </span>
+            <span className="ml-auto">30-day revenue {money(overview.last30.netSales, currency)}</span>
           </div>
         </section>
 
-        {/* Dynamic Price Recommendations */}
-        <section className="lg:col-span-5 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-          <div className="flex items-center justify-between gap-4 mb-5">
-            <div>
-              <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100 flex items-center gap-2">
-                <TrendingUp className="w-4 h-4 text-rose-900 dark:text-rose-400" />
-                <span>Dynamic Price Adjustments</span>
-              </h2>
-              <p className="text-xs text-stone-500 dark:text-zinc-400 mt-0.5">
-                Real-time suggestions based on demand velocity &amp; expiry
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => onNavigate('inventory')}
-              className="text-xs font-medium text-rose-900 dark:text-rose-400 hover:underline cursor-pointer whitespace-nowrap"
-            >
-              Manage All
-            </button>
-          </div>
-
-          {dynamicSuggestions.length === 0 ? (
-            <div className="py-10 text-center">
-              <p className="text-sm font-medium text-stone-700 dark:text-zinc-300">
-                All prices aligned with demand
-              </p>
-              <p className="text-xs text-stone-500 dark:text-zinc-400 mt-1">
-                No urgent price adjustments detected right now.
-              </p>
-            </div>
-          ) : (
-            <div className="divide-y divide-stone-100 dark:divide-zinc-800">
-              {dynamicSuggestions.map(({ product, rec }) => (
-                <div key={product.id} className="py-3 first:pt-0 last:pb-0 space-y-2">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-stone-900 dark:text-zinc-100 truncate">
-                        {product.name}
-                      </p>
-                      <p className="text-xs text-stone-500 dark:text-zinc-400">{rec.reason}</p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void onApplyDynamicPrice(product.id, rec.suggestedPrice)}
-                      className="px-2.5 py-1.5 rounded-lg bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 dark:hover:bg-rose-600 text-white text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      Apply {settings.currency} {rec.suggestedPrice.toLocaleString()}
-                    </button>
-                  </div>
-                  <div className="flex items-center gap-3 text-xs font-mono-num text-stone-500 dark:text-zinc-400">
-                    <span>
-                      Now: {settings.currency} {product.currentPrice.toLocaleString()}
-                    </span>
-                    <span aria-hidden="true">·</span>
-                    <span
-                      className={
-                        rec.deltaPercent >= 0
-                          ? 'text-emerald-600 dark:text-emerald-400'
-                          : 'text-amber-600 dark:text-amber-400'
-                      }
-                    >
-                      {rec.deltaPercent >= 0 ? `+${rec.deltaPercent}%` : `${rec.deltaPercent}%`} ({rec.demandTier})
+        <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+          <SectionHeading title="Payment mix" description="Last 30 days" />
+          <div className="space-y-4">
+            {overview.paymentMix.map((entry) => {
+              const total = overview.paymentMix.reduce((sum, item) => sum + item.amount, 0);
+              const share = total > 0 ? (entry.amount / total) * 100 : 0;
+              const colors =
+                entry.mode === 'Cash'
+                  ? 'bg-emerald-700'
+                  : entry.mode === 'Mpesa'
+                    ? 'bg-sky-700'
+                    : 'bg-amber-600';
+              return (
+                <div key={entry.mode}>
+                  <div className="flex items-center justify-between text-xs mb-1.5">
+                    <span className="font-medium">{entry.mode}</span>
+                    <span className="font-mono text-stone-500 dark:text-zinc-400">
+                      {money(entry.amount, currency)} · {Math.round(share)}%
                     </span>
                   </div>
+                  <div className="h-2 rounded-full bg-stone-100 dark:bg-zinc-800 overflow-hidden">
+                    <div className={cn('h-full rounded-full', colors)} style={{ width: `${Math.max(2, share)}%` }} />
+                  </div>
+                  <p className="text-[10px] text-stone-400 dark:text-zinc-500 mt-1">{entry.count} sale(s)</p>
                 </div>
-              ))}
+              );
+            })}
+          </div>
+          <div className="mt-5 pt-4 border-t border-stone-100 dark:border-zinc-800 grid grid-cols-2 gap-3 text-xs">
+            <div>
+              <p className="text-stone-500 dark:text-zinc-400">Inventory value</p>
+              <p className="font-mono font-semibold mt-0.5">{money(overview.inventoryValue, currency)}</p>
             </div>
+            <div>
+              <p className="text-stone-500 dark:text-zinc-400">Active products</p>
+              <p className="font-mono font-semibold mt-0.5">{overview.totalProducts}</p>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-4">
+        <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+          <SectionHeading
+            title="Low stock"
+            description={`${overview.lowStock.length} item(s) at or below reorder level`}
+            action={
+              <button
+                type="button"
+                onClick={() => onNavigate('inventory')}
+                className="text-xs font-medium text-rose-900 dark:text-rose-400 cursor-pointer"
+              >
+                Manage
+              </button>
+            }
+          />
+          {overview.lowStock.length === 0 ? (
+            <EmptyState icon={<Package className="w-5 h-5" />} title="Stock levels look healthy" />
+          ) : (
+            <ul className="divide-y divide-stone-100 dark:divide-zinc-800">
+              {overview.lowStock.slice(0, 6).map((product) => (
+                <li key={product.id} className="py-2.5 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium truncate">{product.name}</p>
+                    <p className="text-[11px] text-stone-500 dark:text-zinc-400">
+                      {product.category} · reorder at {product.reorderLevel}
+                    </p>
+                  </div>
+                  <Badge tone={product.stock === 0 ? 'red' : 'amber'}>{product.stock} left</Badge>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+          <SectionHeading
+            title="Expiring soon"
+            description="Perishable products within 30 days"
+            action={
+              <button
+                type="button"
+                onClick={() => onNavigate('inventory')}
+                className="text-xs font-medium text-rose-900 dark:text-rose-400 cursor-pointer"
+              >
+                Inspect
+              </button>
+            }
+          />
+          {overview.expiring.length === 0 ? (
+            <EmptyState icon={<CalendarClock className="w-5 h-5" />} title="Nothing expiring soon" />
+          ) : (
+            <ul className="divide-y divide-stone-100 dark:divide-zinc-800">
+              {overview.expiring.slice(0, 6).map((product) => (
+                <li key={product.id} className="py-2.5 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium truncate">{product.name}</p>
+                    <p className="text-[11px] text-stone-500 dark:text-zinc-400">
+                      Expiry {product.expiryDate ? dateOnly(product.expiryDate) : '—'}
+                    </p>
+                  </div>
+                  <Badge tone="amber">{product.stock} in stock</Badge>
+                </li>
+              ))}
+            </ul>
           )}
         </section>
       </div>
 
-      {/* Bottom Actionable Alerts: Low Stock + Perishables */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100 flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400" />
-              <span>Reorder Stock Alerts</span>
-            </h2>
-            <button
-              type="button"
-              onClick={() => onNavigate('inventory')}
-              className="text-xs font-medium text-stone-600 dark:text-zinc-400 hover:text-stone-900 dark:hover:text-zinc-100 cursor-pointer"
-            >
-              View Inventory
-            </button>
-          </div>
-          {lowStockItems.length === 0 ? (
-            <p className="text-sm text-stone-500 dark:text-zinc-400 py-4">
-              Every product is above its reorder threshold.
-            </p>
+      <div className="grid lg:grid-cols-2 gap-4">
+        <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+          <SectionHeading title="Price recommendations" description="Based on the last 7 days of sales" />
+          {loadingPricing ? (
+            <Spinner label="Checking demand…" className="py-8" />
+          ) : recommendations.length === 0 ? (
+            <EmptyState
+              icon={<CircleDollarSign className="w-5 h-5" />}
+              title="Prices are well balanced"
+              description="No adjustments are recommended right now."
+            />
           ) : (
-            <div className="divide-y divide-stone-100 dark:divide-zinc-800">
-              {lowStockItems.map((item) => (
-                <div key={item.id} className="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-3">
+            <ul className="space-y-2.5">
+              {recommendations.slice(0, 5).map((rec) => (
+                <li
+                  key={rec.productId}
+                  className="rounded-lg border border-stone-200 dark:border-zinc-800 p-3 flex items-center justify-between gap-3"
+                >
                   <div className="min-w-0">
-                    <p className="text-sm font-medium text-stone-900 dark:text-zinc-100 truncate">
-                      {item.name}
+                    <p className="text-sm font-medium truncate">
+                      {productNames.get(rec.productId) ?? 'Unknown product'}
                     </p>
-                    <p className="text-xs text-stone-500 dark:text-zinc-400 font-mono-num">
-                      {item.stock} left · Reorder at {item.reorderLevel}
-                    </p>
+                    <p className="text-[11px] text-stone-500 dark:text-zinc-400 line-clamp-2">{rec.reason}</p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <Badge
+                        tone={
+                          rec.demandTier === 'High Demand'
+                            ? 'green'
+                            : rec.demandTier === 'Near Expiry'
+                              ? 'amber'
+                              : rec.demandTier === 'Slow Moving'
+                                ? 'red'
+                                : 'neutral'
+                        }
+                      >
+                        {rec.demandTier}
+                      </Badge>
+                      <span className="text-[11px] font-mono text-stone-500 dark:text-zinc-400">
+                        {money(rec.suggestedPrice, currency)} ({percent(rec.deltaPercent)})
+                      </span>
+                    </div>
                   </div>
                   <button
                     type="button"
-                    onClick={() => void onQuickRestock(item.id, 10)}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-stone-200 dark:border-zinc-700 hover:bg-stone-100 dark:hover:bg-zinc-800 text-xs font-medium text-stone-800 dark:text-zinc-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                    onClick={() => void applyRecommendation(rec)}
+                    disabled={applying === rec.productId}
+                    className="shrink-0 px-2.5 py-1.5 rounded-lg border border-rose-200 dark:border-rose-900 text-xs font-medium text-rose-900 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/40 disabled:opacity-50 cursor-pointer"
                   >
-                    <PackagePlus className="w-3.5 h-3.5" />
-                    <span>+10 Restock</span>
+                    {applying === rec.productId ? 'Applying…' : 'Apply'}
                   </button>
-                </div>
+                </li>
               ))}
-            </div>
+            </ul>
           )}
         </section>
 
-        <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100 flex items-center gap-2">
-              <Clock className="w-4 h-4 text-red-600 dark:text-red-400" />
-              <span>Perishable Expiration Watch</span>
-            </h2>
-            <button
-              type="button"
-              onClick={() => onNavigate('inventory')}
-              className="text-xs font-medium text-stone-600 dark:text-zinc-400 hover:text-stone-900 dark:hover:text-zinc-100 cursor-pointer"
-            >
-              Manage Expiry
-            </button>
-          </div>
-          {expiryAlerts.length === 0 ? (
-            <p className="text-sm text-stone-500 dark:text-zinc-400 py-4">
-              No expired or near-expiry perishable items.
-            </p>
+        <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+          <SectionHeading
+            title="Recent receipts"
+            description="Latest sales from this register"
+            action={
+              <button
+                type="button"
+                onClick={() => onNavigate('receipts')}
+                className="text-xs font-medium text-rose-900 dark:text-rose-400 cursor-pointer"
+              >
+                All receipts
+              </button>
+            }
+          />
+          {overview.recentSales.length === 0 ? (
+            <EmptyState icon={<ShoppingCart className="w-5 h-5" />} title="No sales yet today" />
           ) : (
-            <div className="divide-y divide-stone-100 dark:divide-zinc-800">
-              {expiryAlerts.map((item) => {
-                const exp = getExpiryStatus(item);
-                return (
-                  <div key={item.id} className="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-stone-900 dark:text-zinc-100 truncate">
-                        {item.name}
-                      </p>
-                      <p className="text-xs text-stone-500 dark:text-zinc-400">
-                        {item.category} · Expiry {item.expiryDate}
-                      </p>
-                    </div>
-                    <span
-                      className={`text-xs font-medium whitespace-nowrap shrink-0 ${
-                        exp.level === 'expired'
-                          ? 'text-red-600 dark:text-red-400'
-                          : 'text-amber-600 dark:text-amber-400'
-                      }`}
-                    >
-                      {exp.label}
-                    </span>
+            <ul className="divide-y divide-stone-100 dark:divide-zinc-800">
+              {overview.recentSales.map((sale) => (
+                <li key={sale.id} className="py-2.5 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium font-mono">{sale.receiptNo}</p>
+                    <p className="text-[11px] text-stone-500 dark:text-zinc-400">
+                      {timeOnly(sale.createdAt)} · {sale.paymentMode} · {sale.items.length} item(s)
+                    </p>
                   </div>
-                );
-              })}
+                  <div className="text-right">
+                    <p className="font-mono text-sm">{money(sale.totalAmount, currency)}</p>
+                    {sale.status !== 'Completed' && (
+                      <Badge tone={sale.status === 'Refunded' ? 'red' : 'amber'} className="mt-0.5">
+                        {sale.status}
+                      </Badge>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          {overview.expiring.length > 0 && (
+            <div className="mt-3 flex items-center gap-2 text-[11px] text-amber-700 dark:text-amber-400">
+              <AlertTriangle className="w-3.5 h-3.5" />
+              {overview.expiring.length} perishable item(s) need attention.
             </div>
           )}
         </section>

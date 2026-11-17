@@ -1,797 +1,732 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
-  AlertCircle,
-  Banknote,
-  Calendar,
+  AlertTriangle,
   CheckCircle2,
-  Clock,
-  Edit3,
-  Plus,
+  ChevronDown,
+  ChevronUp,
+  CreditCard,
+  Pencil,
+  Phone,
   Smartphone,
-  UserCheck,
-  X,
+  Users,
+  Wallet,
 } from 'lucide-react';
-import {
-  CreditRecord,
-  CreditStatus,
-  MpesaDetails,
-  Product,
-  StoreSettings,
-} from '../types';
+import type { CreditRecord, MpesaDetails, MpesaInfo, MpesaIntentStatus, StoreSettings } from '../types';
+import { api } from '../lib/api';
 import { computeCreditStatus } from '../lib/dynamicPricing';
+import { cn, dateOnly, dateTime, money, moneyExact } from '../lib/format';
+import { Badge, Button, EmptyState, Modal, SectionHeading, StatCard } from './ui';
 import { MpesaMessagePanel } from './MpesaMessagePanel';
 
 interface CreditPendingViewProps {
   credits: CreditRecord[];
-  products: Product[];
   settings: StoreSettings;
-  onCreateCredit: (payload: {
-    creditorName: string;
-    creditorPhone: string;
-    pendingDate: string;
-    dueDate: string;
-    totalAmount: number;
-    amountPaid: number;
-    notes: string;
-    items: CreditRecord['items'];
-  }) => Promise<void>;
-  onUpdateCredit: (
-    id: string,
-    payload: {
-      creditorName: string;
-      creditorPhone: string;
-      pendingDate: string;
-      dueDate: string;
-      notes: string;
-    },
-  ) => Promise<void>;
-  onRecordPayment: (
-    id: string,
-    payload: {
-      amount: number;
-      method: 'Cash' | 'Mpesa';
-      mpesaDetails?: MpesaDetails;
-      note?: string;
-    },
-  ) => Promise<void>;
+  mpesa: MpesaInfo;
+  onRefresh: () => Promise<void>;
+  showToast: (message: string, kind?: 'success' | 'error' | 'info') => void;
 }
+
+type CreditTab = 'all' | 'Pending' | 'Partial' | 'Overdue' | 'Paid';
+
+const TABS: CreditTab[] = ['all', 'Pending', 'Partial', 'Overdue', 'Paid'];
 
 export const CreditPendingView: React.FC<CreditPendingViewProps> = ({
   credits,
-  products,
   settings,
-  onCreateCredit,
-  onUpdateCredit,
-  onRecordPayment,
+  mpesa,
+  onRefresh,
+  showToast,
 }) => {
-  const [statusFilter, setStatusFilter] = useState<CreditStatus | 'All'>('All');
-  const [editingRecord, setEditingRecord] = useState<CreditRecord | null>(null);
-  const [payingRecord, setPayingRecord] = useState<CreditRecord | null>(null);
-  const [showNewModal, setShowNewModal] = useState(false);
+  const currency = settings.currency;
+  const [tab, setTab] = useState<CreditTab>('all');
+  const [search, setSearch] = useState('');
+  const [expanded, setExpanded] = useState<string | null>(null);
 
-  // Edit Creditor Form State
-  const [editName, setEditName] = useState('');
-  const [editPhone, setEditPhone] = useState('');
-  const [editPendingDate, setEditPendingDate] = useState('');
-  const [editDueDate, setEditDueDate] = useState('');
-  const [editNotes, setEditNotes] = useState('');
-
-  // Payment Settlement State
+  const [payTarget, setPayTarget] = useState<CreditRecord | null>(null);
   const [payAmount, setPayAmount] = useState('');
   const [payMethod, setPayMethod] = useState<'Cash' | 'Mpesa'>('Cash');
+  const [payMpesaMode, setPayMpesaMode] = useState<'stk' | 'manual'>('stk');
+  const [payManual, setPayManual] = useState<{ raw: string; details: MpesaDetails; valid: boolean } | null>(null);
   const [payNote, setPayNote] = useState('');
-  const [mpesaRaw, setMpesaRaw] = useState('');
-  const [mpesaParsed, setMpesaParsed] = useState<MpesaDetails | undefined>(undefined);
+  const [payIntent, setPayIntent] = useState<{ id: string; status: string; message: string; receipt?: string } | null>(null);
+  const [stkBusy, setStkBusy] = useState(false);
+  const [paying, setPaying] = useState(false);
 
-  // New Standalone Credit State
-  const [newName, setNewName] = useState('');
-  const [newPhone, setNewPhone] = useState('');
-  const [newPendingDate, setNewPendingDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const [newDueDate, setNewDueDate] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 7);
-    return d.toISOString().slice(0, 10);
-  });
-  const [newProductId, setNewProductId] = useState(products[0]?.id ?? '');
-  const [newQty, setNewQty] = useState('1');
-  const [newCustomTotal, setNewCustomTotal] = useState('');
-  const [newNotes, setNewNotes] = useState('');
+  const [editTarget, setEditTarget] = useState<CreditRecord | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editPhone, setEditPhone] = useState('');
+  const [editDue, setEditDue] = useState('');
+  const [editNotes, setEditNotes] = useState('');
+  const [editBusy, setEditBusy] = useState(false);
 
-  const enriched = useMemo(() => {
-    return credits.map((c) => ({
-      record: c,
-      status: computeCreditStatus(c),
-      balance: Math.max(0, c.totalAmount - c.amountPaid),
-    }));
-  }, [credits]);
+  const balanceOf = (credit: CreditRecord) => Math.max(0, credit.totalAmount - credit.amountPaid);
+
+  const enriched = useMemo(
+    () =>
+      credits.map((credit) => ({
+        credit,
+        balance: balanceOf(credit),
+        status: computeCreditStatus(credit) as 'Pending' | 'Partial' | 'Overdue' | 'Paid',
+      })),
+    [credits],
+  );
+
+  const stats = useMemo(() => {
+    const open = enriched.filter((entry) => entry.status !== 'Paid');
+    return {
+      outstanding: open.reduce((sum, entry) => sum + entry.balance, 0),
+      overdue: open.filter((entry) => entry.status === 'Overdue').reduce((sum, entry) => sum + entry.balance, 0),
+      customers: open.length,
+      collected: credits.reduce(
+        (sum, credit) => sum + credit.payments.reduce((paid, payment) => paid + payment.amount, 0),
+        0,
+      ),
+    };
+  }, [enriched, credits]);
 
   const filtered = useMemo(() => {
-    if (statusFilter === 'All') return enriched;
-    return enriched.filter((e) => e.status === statusFilter);
-  }, [enriched, statusFilter]);
+    const term = search.trim().toLowerCase();
+    return enriched.filter((entry) => {
+      if (tab !== 'all' && entry.status !== tab) return false;
+      if (!term) return true;
+      return (
+        entry.credit.creditorName.toLowerCase().includes(term) ||
+        entry.credit.creditorPhone.toLowerCase().includes(term) ||
+        entry.credit.notes.toLowerCase().includes(term)
+      );
+    });
+  }, [enriched, tab, search]);
 
-  const totalOutstanding = enriched.reduce((sum, e) => sum + e.balance, 0);
-  const overdueCount = enriched.filter((e) => e.status === 'Overdue').length;
-  const pendingCount = enriched.filter((e) => e.status !== 'Paid').length;
-  const settledAmount = enriched.reduce((sum, e) => sum + e.record.amountPaid, 0);
+  useEffect(() => {
+    if (!payIntent || payIntent.status !== 'pending') return;
+    let cancelled = false;
+    let timer: number | undefined;
+    let attempts = 0;
 
-  const openEditModal = (c: CreditRecord) => {
-    setEditingRecord(c);
-    setEditName(c.creditorName);
-    setEditPhone(c.creditorPhone);
-    setEditPendingDate(c.pendingDate);
-    setEditDueDate(c.dueDate);
-    setEditNotes(c.notes);
-  };
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        const result = await api<{ intent: MpesaIntentStatus }>(`/api/mpesa/status/${payIntent.id}`);
+        if (cancelled) return;
+        if (result.intent.status !== 'pending') {
+          setPayIntent({
+            id: result.intent.id,
+            status: result.intent.status,
+            message: result.intent.resultDesc ?? '',
+            receipt: result.intent.mpesaReceipt ?? undefined,
+          });
+          return;
+        }
+        attempts += 1;
+        if (attempts < 60) timer = window.setTimeout(() => void poll(), 3000);
+      } catch {
+        if (!cancelled) timer = window.setTimeout(() => void poll(), 4000);
+      }
+    };
 
-  const openPayModal = (c: CreditRecord) => {
-    const bal = Math.max(0, c.totalAmount - c.amountPaid);
-    setPayingRecord(c);
-    setPayAmount(String(bal));
-    setPayMethod('Cash');
+    timer = window.setTimeout(() => void poll(), 2200);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [payIntent?.id, payIntent?.status]);
+
+  const openPayment = (credit: CreditRecord, method: 'Cash' | 'Mpesa' = 'Cash') => {
+    setPayTarget(credit);
+    setPayAmount(String(balanceOf(credit)));
+    setPayMethod(method);
+    setPayMpesaMode(mpesa.configured ? 'stk' : 'manual');
+    setPayManual(null);
     setPayNote('');
-    setMpesaRaw('');
-    setMpesaParsed(undefined);
+    setPayIntent(null);
   };
 
-  const handleSaveEdit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingRecord || !editName.trim()) return;
-    await onUpdateCredit(editingRecord.id, {
-      creditorName: editName.trim(),
-      creditorPhone: editPhone.trim(),
-      pendingDate: editPendingDate,
-      dueDate: editDueDate,
-      notes: editNotes.trim(),
-    });
-    setEditingRecord(null);
+  const closePayment = () => {
+    setPayTarget(null);
+    setPayAmount('');
+    setPayManual(null);
+    setPayNote('');
+    setPayIntent(null);
   };
 
-  const handleConfirmPayment = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!payingRecord) return;
-    const amt = Number(payAmount || 0);
-    if (amt <= 0) return;
-    if (payMethod === 'Mpesa' && !mpesaRaw.trim()) return;
-    await onRecordPayment(payingRecord.id, {
-      amount: amt,
-      method: payMethod,
-      mpesaDetails: payMethod === 'Mpesa' ? mpesaParsed : undefined,
-      note: payNote.trim(),
-    });
-    setPayingRecord(null);
+  const openEdit = (credit: CreditRecord) => {
+    setEditTarget(credit);
+    setEditName(credit.creditorName);
+    setEditPhone(credit.creditorPhone);
+    setEditDue(credit.dueDate);
+    setEditNotes(credit.notes);
   };
 
-  const handleCreateCredit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newName.trim()) return;
-    const prod = products.find((p) => p.id === newProductId);
-    const qty = Math.max(1, Number(newQty || 1));
-    const computedTotal =
-      Number(newCustomTotal) > 0
-        ? Number(newCustomTotal)
-        : prod
-          ? prod.currentPrice * qty
-          : 0;
+  const amountValue = Number.parseFloat(payAmount) || 0;
+  const targetBalance = payTarget ? balanceOf(payTarget) : 0;
+  const payManualDetails = payManual?.valid ? payManual.details : null;
 
-    await onCreateCredit({
-      creditorName: newName.trim(),
-      creditorPhone: newPhone.trim(),
-      pendingDate: newPendingDate,
-      dueDate: newDueDate,
-      totalAmount: computedTotal,
-      amountPaid: 0,
-      notes: newNotes.trim(),
-      items: prod
-        ? [
-            {
-              productId: prod.id,
-              productName: prod.name,
-              category: prod.category,
-              quantity: qty,
-              unitPrice: prod.currentPrice,
-              costPrice: prod.costPrice,
-            },
-          ]
-        : [],
-    });
-
-    setShowNewModal(false);
-    setNewName('');
-    setNewPhone('');
-    setNewCustomTotal('');
-    setNewNotes('');
+  const startPaymentStk = async () => {
+    if (!payTarget) return;
+    const phone = payTarget.creditorPhone;
+    if (!phone) {
+      showToast('Add the customer’s phone number before requesting M-Pesa.', 'error');
+      return;
+    }
+    if (amountValue <= 0 || amountValue > targetBalance) {
+      showToast('Enter an amount within the outstanding balance.', 'error');
+      return;
+    }
+    if (!Number.isInteger(amountValue)) {
+      showToast('STK Push needs a whole-shilling amount.', 'error');
+      return;
+    }
+    setStkBusy(true);
+    try {
+      const result = await api<{ intentId: string; status: string; message: string }>('/api/mpesa/stkpush', {
+        method: 'POST',
+        body: {
+          phone,
+          amount: amountValue,
+          purpose: 'credit',
+          accountReference: payTarget.creditorName,
+        },
+      });
+      setPayIntent({ id: result.intentId, status: result.status, message: result.message });
+      showToast('STK Push sent to the customer.', 'info');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not send the STK Push.', 'error');
+    } finally {
+      setStkBusy(false);
+    }
   };
 
-  const renderStatusLabel = (status: CreditStatus) => {
-    switch (status) {
-      case 'Paid':
-        return (
-          <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400">
-            <CheckCircle2 className="w-3.5 h-3.5" />
-            <span>Paid in Full</span>
-          </span>
-        );
-      case 'Overdue':
-        return (
-          <span className="inline-flex items-center gap-1 text-xs font-semibold text-red-600 dark:text-red-400">
-            <AlertCircle className="w-3.5 h-3.5" />
-            <span>Overdue</span>
-          </span>
-        );
-      case 'Partial':
-        return (
-          <span className="inline-flex items-center gap-1 text-xs font-semibold text-amber-600 dark:text-amber-400">
-            <Clock className="w-3.5 h-3.5" />
-            <span>Partial Payment</span>
-          </span>
-        );
-      default:
-        return (
-          <span className="inline-flex items-center gap-1 text-xs font-semibold text-stone-700 dark:text-zinc-300">
-            <Clock className="w-3.5 h-3.5" />
-            <span>Pending</span>
-          </span>
-        );
+  const submitPayment = async () => {
+    if (!payTarget) return;
+    if (amountValue <= 0) {
+      showToast('Enter the payment amount.', 'error');
+      return;
+    }
+    if (amountValue > targetBalance + 0.001) {
+      showToast(`The balance is only ${moneyExact(targetBalance, currency)}.`, 'error');
+      return;
+    }
+    if (payMethod === 'Mpesa') {
+      if (payMpesaMode === 'stk' && payIntent?.status !== 'success') {
+        showToast('Wait for the M-Pesa payment to be confirmed.', 'error');
+        return;
+      }
+      if (payMpesaMode === 'manual' && !payManualDetails) {
+        showToast('Attach a valid M-Pesa confirmation message.', 'error');
+        return;
+      }
+    }
+    setPaying(true);
+    try {
+      await api(`/api/credits/${payTarget.id}/payments`, {
+        method: 'POST',
+        body: {
+          amount: amountValue,
+          method: payMethod,
+          note: payNote.trim() || undefined,
+          mpesa:
+            payMethod === 'Mpesa'
+              ? payMpesaMode === 'stk'
+                ? { intentId: payIntent?.id }
+                : {
+                    transactionCode: payManualDetails?.transactionCode,
+                    amountReceived: payManualDetails?.amountReceived,
+                    senderName: payManualDetails?.senderName,
+                    senderPhone: payManualDetails?.senderPhone,
+                    rawMessage: payManualDetails?.rawMessage,
+                  }
+              : undefined,
+        },
+      });
+      await onRefresh();
+      showToast(`Payment of ${money(amountValue, currency)} recorded for ${payTarget.creditorName}.`);
+      closePayment();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not record the payment.', 'error');
+    } finally {
+      setPaying(false);
+    }
+  };
+
+  const submitEdit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!editTarget) return;
+    setEditBusy(true);
+    try {
+      await api(`/api/credits/${editTarget.id}`, {
+        method: 'PATCH',
+        body: {
+          customerName: editName.trim(),
+          customerPhone: editPhone.trim(),
+          dueDate: editDue,
+          notes: editNotes.trim(),
+        },
+      });
+      await onRefresh();
+      showToast('Credit account updated.');
+      setEditTarget(null);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not update the credit account.', 'error');
+    } finally {
+      setEditBusy(false);
     }
   };
 
   return (
-    <div className="space-y-6">
-      {/* KPI Strip */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">
-            Outstanding Credit Balance
-          </p>
-          <p className="mt-2 text-2xl font-semibold font-mono-num text-stone-900 dark:text-zinc-50">
-            {settings.currency} {totalOutstanding.toLocaleString()}
-          </p>
-        </div>
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">Active Accounts</p>
-          <p className="mt-2 text-2xl font-semibold font-mono-num text-stone-900 dark:text-zinc-50">
-            {pendingCount} creditors
-          </p>
-        </div>
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">Overdue Accounts</p>
-          <p
-            className={`mt-2 text-2xl font-semibold font-mono-num ${
-              overdueCount > 0
-                ? 'text-red-600 dark:text-red-400'
-                : 'text-emerald-600 dark:text-emerald-400'
-            }`}
-          >
-            {overdueCount} overdue
-          </p>
-        </div>
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">Collected So Far</p>
-          <p className="mt-2 text-2xl font-semibold font-mono-num text-emerald-700 dark:text-emerald-400">
-            {settings.currency} {settledAmount.toLocaleString()}
-          </p>
-        </div>
-      </div>
-
-      {/* Filter & Add Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {(['All', 'Pending', 'Partial', 'Overdue', 'Paid'] as const).map((status) => (
-            <button
-              key={status}
-              type="button"
-              onClick={() => setStatusFilter(status)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
-                statusFilter === status
-                  ? 'bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
-                  : 'bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-800 text-stone-600 dark:text-zinc-300 hover:bg-stone-100 dark:hover:bg-zinc-800'
-              }`}
-            >
-              {status}
-            </button>
-          ))}
-        </div>
-
-        <button
-          type="button"
-          onClick={() => setShowNewModal(true)}
-          className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 dark:hover:bg-rose-600 text-white text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Add Credit / Pending Entry</span>
-        </button>
-      </div>
-
-      {/* Credit & Pending List */}
-      <div className="space-y-4">
-        {filtered.length === 0 ? (
-          <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 py-14 text-center">
-            <UserCheck className="w-8 h-8 text-stone-300 dark:text-zinc-600 mx-auto mb-2" />
-            <p className="text-sm font-medium text-stone-700 dark:text-zinc-300">
-              No credit or pending accounts in this filter
-            </p>
+    <div className="space-y-5">
+      <SectionHeading
+        title="Credits & pending"
+        description="Track customer balances, due dates and payments."
+        action={
+          <div className="relative">
+            <input
+              type="search"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search customer or phone…"
+              className="pl-3 pr-3 py-2 w-56 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-sm focus:outline-none focus:ring-2 focus:ring-rose-800/30"
+            />
           </div>
-        ) : (
-          filtered.map(({ record, status, balance }) => (
-            <div
-              key={record.id}
-              className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 space-y-4"
-            >
-              <div className="flex flex-col md:flex-row md:items-start justify-between gap-4">
-                <div className="space-y-1">
-                  <div className="flex flex-wrap items-center gap-3">
-                    <h3 className="text-base font-semibold text-stone-900 dark:text-zinc-100">
-                      {record.creditorName}
-                    </h3>
-                    {renderStatusLabel(status)}
-                  </div>
-                  <p className="text-xs text-stone-500 dark:text-zinc-400 flex flex-wrap items-center gap-x-3 gap-y-1">
-                    {record.creditorPhone && (
-                      <span className="font-mono-num">{record.creditorPhone}</span>
-                    )}
-                    <span className="inline-flex items-center gap-1 font-mono-num">
-                      <Calendar className="w-3.5 h-3.5" />
-                      Pending Day: {record.pendingDate}
-                    </span>
-                    <span className="font-mono-num">Due: {record.dueDate}</span>
-                  </p>
-                  {record.notes && (
-                    <p className="text-xs text-stone-600 dark:text-zinc-400 pt-1">{record.notes}</p>
-                  )}
-                </div>
+        }
+      />
 
-                <div className="flex flex-wrap items-center gap-2 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => openEditModal(record)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 hover:bg-stone-100 dark:hover:bg-zinc-800 text-xs font-medium text-stone-700 dark:text-zinc-200 transition-colors cursor-pointer whitespace-nowrap"
-                  >
-                    <Edit3 className="w-3.5 h-3.5" />
-                    <span>Edit Creditor &amp; Date</span>
-                  </button>
-                  {balance > 0 && (
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <StatCard
+          label="Outstanding"
+          value={money(stats.outstanding, currency)}
+          sub={`${stats.customers} open account(s)`}
+          icon={<CreditCard className="w-4 h-4" />}
+          accent="amber"
+        />
+        <StatCard
+          label="Overdue"
+          value={money(stats.overdue, currency)}
+          sub="Past the agreed due date"
+          icon={<AlertTriangle className="w-4 h-4" />}
+          accent="rose"
+        />
+        <StatCard
+          label="Collected"
+          value={money(stats.collected, currency)}
+          sub="All recorded credit payments"
+          icon={<Wallet className="w-4 h-4" />}
+          accent="emerald"
+        />
+        <StatCard
+          label="Customers"
+          value={String(stats.customers)}
+          sub="With an open balance"
+          icon={<Users className="w-4 h-4" />}
+          accent="sky"
+        />
+      </div>
+
+      <div className="flex flex-wrap gap-1.5">
+        {TABS.map((entry) => {
+          const count =
+            entry === 'all' ? enriched.length : enriched.filter((item) => item.status === entry).length;
+          return (
+            <button
+              key={entry}
+              type="button"
+              onClick={() => setTab(entry)}
+              className={cn(
+                'px-3 py-1.5 rounded-full border text-xs font-medium cursor-pointer',
+                tab === entry
+                  ? 'bg-rose-900 border-rose-900 text-white'
+                  : 'border-stone-200 dark:border-zinc-700 text-stone-600 dark:text-zinc-300 hover:bg-stone-100 dark:hover:bg-zinc-800',
+              )}
+            >
+              {entry === 'all' ? 'All accounts' : entry} ({count})
+            </button>
+          );
+        })}
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
+          <EmptyState
+            icon={<CreditCard className="w-5 h-5" />}
+            title="No credit accounts here"
+            description="Credit sales made at the register appear here until they are fully paid."
+          />
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {filtered.map(({ credit, balance, status }) => {
+            const isOpen = expanded === credit.id;
+            const totalPaid = credit.totalAmount - balance;
+            const progress = credit.totalAmount > 0 ? Math.min(100, (totalPaid / credit.totalAmount) * 100) : 0;
+            return (
+              <div
+                key={credit.id}
+                className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 overflow-hidden"
+              >
+                <div className="p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h3 className="text-sm font-semibold truncate">{credit.creditorName}</h3>
+                        <Badge
+                          tone={
+                            status === 'Paid'
+                              ? 'green'
+                              : status === 'Overdue'
+                                ? 'red'
+                                : status === 'Partial'
+                                  ? 'blue'
+                                  : 'amber'
+                          }
+                        >
+                          {status}
+                        </Badge>
+                        {credit.saleId && <Badge tone="neutral">Linked sale</Badge>}
+                      </div>
+                      <p className="text-[11px] text-stone-500 dark:text-zinc-400 mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                        {credit.creditorPhone && (
+                          <span className="inline-flex items-center gap-1">
+                            <Phone className="w-3 h-3" /> {credit.creditorPhone}
+                          </span>
+                        )}
+                        <span>Due {dateOnly(credit.dueDate)}</span>
+                        <span>{credit.items.length} item line(s)</span>
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="font-mono text-lg font-semibold">{money(balance, currency)}</p>
+                      <p className="text-[11px] text-stone-500 dark:text-zinc-400">
+                        of {money(credit.totalAmount, currency)}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 h-1.5 rounded-full bg-stone-100 dark:bg-zinc-800 overflow-hidden">
+                    <div
+                      className={cn(
+                        'h-full rounded-full',
+                        status === 'Paid' ? 'bg-emerald-600' : status === 'Overdue' ? 'bg-red-600' : 'bg-rose-800',
+                      )}
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between mt-1 text-[10px] text-stone-400 dark:text-zinc-500">
+                    <span>Paid {money(totalPaid, currency)}</span>
+                    <span>{credit.payments.length} payment(s)</span>
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    {status !== 'Paid' && (
+                      <>
+                        <Button size="sm" onClick={() => openPayment(credit, 'Cash')}>
+                          <Wallet className="w-3.5 h-3.5" /> Record payment
+                        </Button>
+                        {mpesa.configured && credit.creditorPhone && (
+                          <Button size="sm" variant="secondary" onClick={() => openPayment(credit, 'Mpesa')}>
+                            <Smartphone className="w-3.5 h-3.5" /> Request M-Pesa
+                          </Button>
+                        )}
+                      </>
+                    )}
+                    <Button size="sm" variant="ghost" onClick={() => openEdit(credit)}>
+                      <Pencil className="w-3.5 h-3.5" /> Edit
+                    </Button>
                     <button
                       type="button"
-                      onClick={() => openPayModal(record)}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 dark:hover:bg-rose-600 text-white text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap"
+                      onClick={() => setExpanded(isOpen ? null : credit.id)}
+                      className="ml-auto inline-flex items-center gap-1 text-xs font-medium text-stone-500 dark:text-zinc-400 hover:text-stone-900 dark:hover:text-zinc-100 cursor-pointer"
                     >
-                      <span>Record Payment</span>
+                      {isOpen ? 'Hide details' : 'Details'}
+                      {isOpen ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
                     </button>
-                  )}
-                </div>
-              </div>
-
-              {/* Financial & Products Summary */}
-              <div className="pt-3 border-t border-stone-100 dark:border-zinc-800 grid grid-cols-1 md:grid-cols-12 gap-4 items-center">
-                <div className="md:col-span-7 text-xs text-stone-600 dark:text-zinc-400">
-                  <span className="font-medium text-stone-800 dark:text-zinc-200">
-                    Pending Products:{' '}
-                  </span>
-                  {record.items.length > 0
-                    ? record.items.map((i) => `${i.quantity}× ${i.productName}`).join(' · ')
-                    : 'Manual credit balance'}
-                </div>
-
-                <div className="md:col-span-5 flex items-center md:justify-end gap-5 text-xs font-mono-num">
-                  <div>
-                    <span className="text-stone-400 dark:text-zinc-500 block text-[11px]">Total</span>
-                    <span className="font-medium text-stone-800 dark:text-zinc-200">
-                      {settings.currency} {record.totalAmount.toLocaleString()}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-stone-400 dark:text-zinc-500 block text-[11px]">Paid</span>
-                    <span className="font-medium text-emerald-700 dark:text-emerald-400">
-                      {settings.currency} {record.amountPaid.toLocaleString()}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-stone-400 dark:text-zinc-500 block text-[11px]">Balance</span>
-                    <span className="font-semibold text-stone-900 dark:text-zinc-50">
-                      {settings.currency} {balance.toLocaleString()}
-                    </span>
                   </div>
                 </div>
-              </div>
 
-              {/* Real-time Payment History */}
-              {record.payments.length > 0 && (
-                <div className="pt-3 border-t border-stone-100 dark:border-zinc-800 space-y-1.5">
-                  <p className="text-[11px] font-medium text-stone-500 dark:text-zinc-400">
-                    Real-Time Payment History
-                  </p>
-                  {record.payments.map((pmt) => (
-                    <div
-                      key={pmt.id}
-                      className="flex flex-wrap items-center justify-between gap-2 text-xs text-stone-600 dark:text-zinc-300"
-                    >
-                      <span>
-                        {pmt.method}
-                        {pmt.mpesaDetails?.transactionCode
-                          ? ` (${pmt.mpesaDetails.transactionCode})`
-                          : ''}
-                        {pmt.note ? ` · ${pmt.note}` : ''}
-                      </span>
-                      <span className="font-mono-num">
-                        +{settings.currency} {pmt.amount.toLocaleString()} ·{' '}
-                        {new Date(pmt.paidAt).toLocaleDateString()}
-                      </span>
+                {isOpen && (
+                  <div className="border-t border-stone-100 dark:border-zinc-800 bg-stone-50/60 dark:bg-zinc-950/30 px-4 py-3 grid md:grid-cols-2 gap-4">
+                    <div>
+                      <p className="text-[11px] uppercase tracking-wider font-semibold text-stone-500 dark:text-zinc-400 mb-1.5">
+                        Items on credit
+                      </p>
+                      <ul className="space-y-1">
+                        {credit.items.map((item, index) => (
+                          <li key={item.id ?? `${item.productId}-${index}`} className="flex justify-between text-xs">
+                            <span className="truncate pr-2">
+                              {item.productName} × {item.quantity}
+                            </span>
+                            <span className="font-mono">{moneyExact(item.unitPrice * item.quantity, currency)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                      {credit.notes && (
+                        <p className="text-[11px] text-stone-500 dark:text-zinc-400 mt-2 whitespace-pre-line">
+                          {credit.notes}
+                        </p>
+                      )}
                     </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))
-        )}
-      </div>
-
-      {/* Edit Creditor Name & Pending Date Modal */}
-      {editingRecord && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-4">
-          <form
-            onSubmit={handleSaveEdit}
-            className="w-full max-w-md rounded-2xl bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-800 p-6 space-y-4 shadow-xl"
-          >
-            <div className="flex items-center justify-between">
-              <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100">
-                Edit Creditor &amp; Pending Day
-              </h2>
-              <button
-                type="button"
-                onClick={() => setEditingRecord(null)}
-                className="p-1.5 rounded-lg text-stone-400 hover:text-stone-700 dark:hover:text-zinc-200 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                  Creditor Name *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={editName}
-                  onChange={(e) => setEditName(e.target.value)}
-                  className="w-full px-3.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm text-stone-900 dark:text-zinc-100"
-                />
+                    <div>
+                      <p className="text-[11px] uppercase tracking-wider font-semibold text-stone-500 dark:text-zinc-400 mb-1.5">
+                        Payment history
+                      </p>
+                      {credit.payments.length === 0 ? (
+                        <p className="text-xs text-stone-500 dark:text-zinc-400">No payments recorded yet.</p>
+                      ) : (
+                        <ul className="space-y-1.5">
+                          {credit.payments.map((payment) => (
+                            <li key={payment.id} className="flex items-start justify-between gap-2 text-xs">
+                              <div className="min-w-0">
+                                <p className="font-medium">
+                                  {payment.method}
+                                  {payment.mpesaDetails?.transactionCode && (
+                                    <span className="ml-1 font-mono text-[10px] text-stone-500">
+                                      {payment.mpesaDetails.transactionCode}
+                                    </span>
+                                  )}
+                                </p>
+                                <p className="text-[10px] text-stone-400 dark:text-zinc-500">
+                                  {dateTime(payment.paidAt)}
+                                  {payment.note ? ` · ${payment.note}` : ''}
+                                </p>
+                              </div>
+                              <span className="font-mono shrink-0">{moneyExact(payment.amount, currency)}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
-              <div>
-                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                  Phone Number
-                </label>
-                <input
-                  type="tel"
-                  value={editPhone}
-                  onChange={(e) => setEditPhone(e.target.value)}
-                  className="w-full px-3.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                    Pending Day Date
-                  </label>
-                  <input
-                    type="date"
-                    required
-                    value={editPendingDate}
-                    onChange={(e) => setEditPendingDate(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                    Due Date
-                  </label>
-                  <input
-                    type="date"
-                    required
-                    value={editDueDate}
-                    onChange={(e) => setEditDueDate(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
-                  />
-                </div>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                  Notes
-                </label>
-                <textarea
-                  rows={2}
-                  value={editNotes}
-                  onChange={(e) => setEditNotes(e.target.value)}
-                  className="w-full px-3.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs text-stone-900 dark:text-zinc-100"
-                />
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setEditingRecord(null)}
-                className="px-4 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 text-xs font-medium text-stone-700 dark:text-zinc-300 cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                className="px-4 py-2 rounded-lg bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 text-white text-xs font-semibold cursor-pointer"
-              >
-                Update Creditor
-              </button>
-            </div>
-          </form>
+            );
+          })}
         </div>
       )}
 
-      {/* Record Payment Modal */}
-      {payingRecord && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-4 overflow-y-auto">
-          <form
-            onSubmit={handleConfirmPayment}
-            className="w-full max-w-lg rounded-2xl bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-800 p-6 space-y-4 shadow-xl my-8"
-          >
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100">
-                  Settle Payment · {payingRecord.creditorName}
-                </h2>
-                <p className="text-xs text-stone-500 dark:text-zinc-400 font-mono-num">
-                  Remaining Balance: {settings.currency}{' '}
-                  {Math.max(0, payingRecord.totalAmount - payingRecord.amountPaid).toLocaleString()}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setPayingRecord(null)}
-                className="p-1.5 rounded-lg text-stone-400 hover:text-stone-700 dark:hover:text-zinc-200 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                  Amount ({settings.currency})
-                </label>
-                <input
-                  type="number"
-                  required
-                  min={1}
-                  max={Math.max(1, payingRecord.totalAmount - payingRecord.amountPaid)}
-                  value={payAmount}
-                  onChange={(e) => setPayAmount(e.target.value)}
-                  className="w-full px-3.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                  Payment Method
-                </label>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setPayMethod('Cash')}
-                    className={`py-2 px-3 rounded-lg border text-xs font-medium flex items-center justify-center gap-1.5 cursor-pointer ${
-                      payMethod === 'Cash'
-                        ? 'bg-rose-900 border-rose-900 text-white dark:bg-rose-700'
-                        : 'border-stone-200 dark:border-zinc-700 text-stone-700 dark:text-zinc-300'
-                    }`}
-                  >
-                    <Banknote className="w-3.5 h-3.5" />
-                    <span>Cash</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setPayMethod('Mpesa')}
-                    className={`py-2 px-3 rounded-lg border text-xs font-medium flex items-center justify-center gap-1.5 cursor-pointer ${
-                      payMethod === 'Mpesa'
-                        ? 'bg-rose-900 border-rose-900 text-white dark:bg-rose-700'
-                        : 'border-stone-200 dark:border-zinc-700 text-stone-700 dark:text-zinc-300'
-                    }`}
-                  >
-                    <Smartphone className="w-3.5 h-3.5" />
-                    <span>M-Pesa</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {payMethod === 'Mpesa' && (
-              <MpesaMessagePanel
-                expectedAmount={Number(payAmount || 0)}
-                tillNumber={settings.mpesaTillNumber}
-                value={mpesaRaw}
-                onChange={(raw, parsed) => {
-                  setMpesaRaw(raw);
-                  setMpesaParsed(parsed);
-                }}
-              />
-            )}
-
-            <div>
-              <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                Payment Note (optional)
-              </label>
-              <input
-                type="text"
-                value={payNote}
-                onChange={(e) => setPayNote(e.target.value)}
-                placeholder="e.g. Second installment"
-                className="w-full px-3.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs text-stone-900 dark:text-zinc-100"
-              />
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setPayingRecord(null)}
-                className="px-4 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 text-xs font-medium text-stone-700 dark:text-zinc-300 cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={payMethod === 'Mpesa' && !mpesaRaw.trim()}
-                className="px-4 py-2 rounded-lg bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 disabled:opacity-45 text-white text-xs font-semibold cursor-pointer"
-              >
-                Save Payment
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* Add Standalone Credit / Pending Entry Modal */}
-      {showNewModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-4">
-          <form
-            onSubmit={handleCreateCredit}
-            className="w-full max-w-md rounded-2xl bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-800 p-6 space-y-4 shadow-xl"
-          >
-            <div className="flex items-center justify-between">
-              <h2 className="text-base font-semibold text-stone-900 dark:text-zinc-100">
-                New Credit / Pending Entry
-              </h2>
-              <button
-                type="button"
-                onClick={() => setShowNewModal(false)}
-                className="p-1.5 rounded-lg text-stone-400 hover:text-stone-700 dark:hover:text-zinc-200 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                  Creditor Name *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  placeholder="Customer or salon name"
-                  className="w-full px-3.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm text-stone-900 dark:text-zinc-100"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                  Phone Number
-                </label>
-                <input
-                  type="tel"
-                  value={newPhone}
-                  onChange={(e) => setNewPhone(e.target.value)}
-                  placeholder="0712..."
-                  className="w-full px-3.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono-num text-stone-900 dark:text-zinc-100"
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                    Pending Day Date
-                  </label>
-                  <input
-                    type="date"
-                    value={newPendingDate}
-                    onChange={(e) => setNewPendingDate(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                    Due Date
-                  </label>
-                  <input
-                    type="date"
-                    value={newDueDate}
-                    onChange={(e) => setNewDueDate(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
-                  />
-                </div>
-              </div>
-              <div className="grid grid-cols-3 gap-2">
-                <div className="col-span-2">
-                  <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                    Product
-                  </label>
-                  <select
-                    value={newProductId}
-                    onChange={(e) => setNewProductId(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs text-stone-900 dark:text-zinc-100"
-                  >
-                    {products.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name} ({settings.currency} {p.currentPrice})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                    Qty
-                  </label>
-                  <input
-                    type="number"
-                    min={1}
-                    value={newQty}
-                    onChange={(e) => setNewQty(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
-                  />
-                </div>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                  Override Total ({settings.currency}, optional)
-                </label>
+      <Modal
+        open={payTarget !== null}
+        onClose={closePayment}
+        title="Record credit payment"
+        subtitle={payTarget ? `${payTarget.creditorName} · balance ${moneyExact(targetBalance, currency)}` : undefined}
+        size="md"
+        footer={
+          <>
+            <Button variant="secondary" onClick={closePayment}>
+              Cancel
+            </Button>
+            <Button onClick={() => void submitPayment()} loading={paying}>
+              <CheckCircle2 className="w-4 h-4" /> Save payment
+            </Button>
+          </>
+        }
+      >
+        {payTarget && (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-2">
+              <label className="block text-xs font-medium">
+                Amount ({currency})
                 <input
                   type="number"
                   min={0}
-                  value={newCustomTotal}
-                  onChange={(e) => setNewCustomTotal(e.target.value)}
-                  placeholder="Leave blank to calculate from product"
-                  className="w-full px-3.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
+                  max={targetBalance}
+                  step="0.01"
+                  value={payAmount}
+                  onChange={(event) => setPayAmount(event.target.value)}
+                  disabled={payIntent?.status === 'pending' || payIntent?.status === 'success'}
+                  className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-rose-800/30"
                 />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-stone-600 dark:text-zinc-400 mb-1">
-                  Notes
-                </label>
-                <input
-                  type="text"
-                  value={newNotes}
-                  onChange={(e) => setNewNotes(e.target.value)}
-                  placeholder="Optional agreement notes"
-                  className="w-full px-3.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs text-stone-900 dark:text-zinc-100"
-                />
-              </div>
+              </label>
+              <label className="block text-xs font-medium">
+                Method
+                <select
+                  value={payMethod}
+                  onChange={(event) => setPayMethod(event.target.value as 'Cash' | 'Mpesa')}
+                  disabled={payIntent?.status === 'pending' || payIntent?.status === 'success'}
+                  className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm focus:outline-none"
+                >
+                  <option value="Cash">Cash</option>
+                  <option value="Mpesa" disabled={!mpesa.configured && !mpesa.manualEnabled}>
+                    M-Pesa
+                  </option>
+                </select>
+              </label>
+            </div>
+            <div className="flex gap-1.5">
+              {[targetBalance, Math.min(1000, targetBalance), Math.min(500, targetBalance)].map((value, index) => (
+                <button
+                  key={`${value}-${index}`}
+                  type="button"
+                  onClick={() => setPayAmount(String(value))}
+                  className="px-2.5 py-1 rounded-md bg-stone-100 dark:bg-zinc-800 text-[11px] font-mono hover:bg-stone-200 dark:hover:bg-zinc-700 cursor-pointer"
+                >
+                  {value.toLocaleString()}
+                </button>
+              ))}
             </div>
 
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setShowNewModal(false)}
-                className="px-4 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 text-xs font-medium text-stone-700 dark:text-zinc-300 cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                className="px-4 py-2 rounded-lg bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 text-white text-xs font-semibold cursor-pointer"
-              >
-                Save Credit Entry
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
+            {payMethod === 'Mpesa' && (
+              <div className="rounded-lg border border-stone-200 dark:border-zinc-800 p-2.5 space-y-2">
+                {mpesa.configured && mpesa.manualEnabled && (
+                  <div className="inline-flex rounded-md border border-stone-200 dark:border-zinc-700 overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setPayMpesaMode('stk')}
+                      className={cn(
+                        'px-2 py-1 text-[10px] font-medium cursor-pointer',
+                        payMpesaMode === 'stk' ? 'bg-rose-900 text-white' : 'text-stone-600 dark:text-zinc-300',
+                      )}
+                    >
+                      STK Push
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPayMpesaMode('manual')}
+                      className={cn(
+                        'px-2 py-1 text-[10px] font-medium cursor-pointer',
+                        payMpesaMode === 'manual' ? 'bg-rose-900 text-white' : 'text-stone-600 dark:text-zinc-300',
+                      )}
+                    >
+                      SMS code
+                    </button>
+                  </div>
+                )}
+                {payMpesaMode === 'stk' && mpesa.configured ? (
+                  <div className="space-y-2">
+                    <p className="text-[11px] text-stone-500 dark:text-zinc-400">
+                      Send an STK Push of {money(amountValue, currency)} to{' '}
+                      {payTarget.creditorPhone || 'the customer'}.
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="success"
+                      onClick={() => void startPaymentStk()}
+                      loading={stkBusy}
+                      disabled={payIntent?.status === 'pending' || payIntent?.status === 'success'}
+                    >
+                      <Smartphone className="w-3.5 h-3.5" />
+                      {payIntent?.status === 'success' ? 'Payment confirmed' : 'Send STK Push'}
+                    </Button>
+                    {payIntent && (
+                      <div
+                        className={cn(
+                          'rounded-md px-2.5 py-2 text-[11px]',
+                          payIntent.status === 'success'
+                            ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300'
+                            : payIntent.status === 'pending'
+                              ? 'bg-sky-50 dark:bg-sky-950/40 text-sky-800 dark:text-sky-300'
+                              : 'bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300',
+                        )}
+                      >
+                        <p className="font-medium">
+                          {payIntent.status === 'success'
+                            ? `Confirmed${payIntent.receipt ? ` · ${payIntent.receipt}` : ''}`
+                            : payIntent.status === 'pending'
+                              ? 'Waiting for the customer…'
+                              : `Payment ${payIntent.status}`}
+                        </p>
+                        {payIntent.message && <p className="opacity-80 mt-0.5">{payIntent.message}</p>}
+                        {payIntent.status !== 'success' && payIntent.status !== 'pending' && (
+                          <button
+                            type="button"
+                            onClick={() => setPayIntent(null)}
+                            className="underline underline-offset-2 mt-1 cursor-pointer"
+                          >
+                            Try again
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ) : mpesa.manualEnabled ? (
+                  <MpesaMessagePanel
+                    expectedAmount={amountValue}
+                    tillNumber={settings.mpesaTillNumber || '—'}
+                    value={payManual?.raw ?? ''}
+                    onChange={(raw, details, valid) => setPayManual({ raw, details, valid })}
+                  />
+                ) : (
+                  <p className="text-[11px] text-amber-700 dark:text-amber-400">
+                    M-Pesa payments are not configured for this store.
+                  </p>
+                )}
+              </div>
+            )}
+
+            <label className="block text-xs font-medium">
+              Note
+              <input
+                type="text"
+                value={payNote}
+                onChange={(event) => setPayNote(event.target.value)}
+                placeholder="Optional reference"
+                className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm focus:outline-none focus:ring-2 focus:ring-rose-800/30"
+              />
+            </label>
+            <p className="text-[11px] text-stone-500 dark:text-zinc-400">
+              New balance after this payment:{' '}
+              <span className="font-mono font-semibold">
+                {money(Math.max(0, targetBalance - amountValue), currency)}
+              </span>
+            </p>
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={editTarget !== null}
+        onClose={() => setEditTarget(null)}
+        title="Edit credit account"
+        subtitle={editTarget?.creditorName}
+        size="sm"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setEditTarget(null)}>
+              Cancel
+            </Button>
+            <Button type="submit" form="edit-credit-form" loading={editBusy}>
+              Save changes
+            </Button>
+          </>
+        }
+      >
+        <form id="edit-credit-form" onSubmit={(event) => void submitEdit(event)} className="space-y-3">
+          <label className="block text-xs font-medium">
+            Customer name
+            <input
+              type="text"
+              value={editName}
+              onChange={(event) => setEditName(event.target.value)}
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm focus:outline-none focus:ring-2 focus:ring-rose-800/30"
+            />
+          </label>
+          <label className="block text-xs font-medium">
+            Phone
+            <input
+              type="tel"
+              value={editPhone}
+              onChange={(event) => setEditPhone(event.target.value)}
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm focus:outline-none focus:ring-2 focus:ring-rose-800/30"
+            />
+          </label>
+          <label className="block text-xs font-medium">
+            Due date
+            <input
+              type="date"
+              value={editDue}
+              min={editTarget?.pendingDate}
+              onChange={(event) => setEditDue(event.target.value)}
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm focus:outline-none focus:ring-2 focus:ring-rose-800/30"
+            />
+          </label>
+          <label className="block text-xs font-medium">
+            Notes
+            <textarea
+              rows={3}
+              value={editNotes}
+              onChange={(event) => setEditNotes(event.target.value)}
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm focus:outline-none focus:ring-2 focus:ring-rose-800/30"
+            />
+          </label>
+        </form>
+      </Modal>
     </div>
   );
 };

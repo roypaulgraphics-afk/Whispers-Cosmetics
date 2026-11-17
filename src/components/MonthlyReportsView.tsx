@@ -1,326 +1,469 @@
-import React, { useMemo, useState } from 'react';
-import { Download, Printer } from 'lucide-react';
-import { PRODUCT_CATEGORIES, Product, SaleTransaction, StoreSettings } from '../types';
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  ArrowDownRight,
+  ArrowUpRight,
+  BarChart3,
+  Download,
+  RefreshCw,
+  TrendingUp,
+} from 'lucide-react';
+import type { AppMeta, PaymentMode, ReportData, SaleTransaction, StoreSettings } from '../types';
+import { api, withQuery } from '../lib/api';
+import { addDays, cn, dateOnly, money, percent } from '../lib/format';
+import { Badge, Button, EmptyState, SectionHeading, Spinner, StatCard } from './ui';
 
 interface MonthlyReportsViewProps {
-  transactions: SaleTransaction[];
-  products: Product[];
   settings: StoreSettings;
+  meta: AppMeta;
+  showToast: (message: string, kind?: 'success' | 'error' | 'info') => void;
 }
 
-export const MonthlyReportsView: React.FC<MonthlyReportsViewProps> = ({
-  transactions,
-  settings,
-}) => {
-  const [selectedMonth, setSelectedMonth] = useState(() => new Date().toISOString().slice(0, 7));
+type Preset = 'today' | 'yesterday' | '7d' | '30d' | 'month' | 'lastMonth' | 'custom';
 
-  const monthTransactions = useMemo(() => {
-    if (!selectedMonth) return transactions;
-    return transactions.filter((tx) => tx.createdAt.slice(0, 7) === selectedMonth);
-  }, [transactions, selectedMonth]);
+interface Range {
+  from: string;
+  to: string;
+}
 
-  const metrics = useMemo(() => {
-    let totalRevenue = 0;
-    let totalCost = 0;
-    let cashTotal = 0;
-    let mpesaTotal = 0;
-    let creditTotal = 0;
-    let unitsSold = 0;
+function monthStart(date: string): string {
+  return `${date.slice(0, 8)}01`;
+}
 
-    const categoryMap = new Map<string, { revenue: number; units: number }>();
-    for (const cat of PRODUCT_CATEGORIES) {
-      categoryMap.set(cat, { revenue: 0, units: 0 });
+function previousMonth(date: string): Range {
+  const first = new Date(`${monthStart(date)}T00:00:00Z`);
+  first.setUTCMonth(first.getUTCMonth() - 1);
+  const start = first.toISOString().slice(0, 10);
+  const end = new Date(`${monthStart(date)}T00:00:00Z`);
+  end.setUTCDate(0);
+  return { from: start, to: end.toISOString().slice(0, 10) };
+}
+
+function presetRange(preset: Preset, today: string): Range {
+  switch (preset) {
+    case 'today':
+      return { from: today, to: today };
+    case 'yesterday':
+      return { from: addDays(today, -1), to: addDays(today, -1) };
+    case '7d':
+      return { from: addDays(today, -6), to: today };
+    case '30d':
+      return { from: addDays(today, -29), to: today };
+    case 'month':
+      return { from: monthStart(today), to: today };
+    case 'lastMonth':
+      return previousMonth(today);
+    default:
+      return { from: addDays(today, -29), to: today };
+  }
+}
+
+function change(current: number, previous: number): number | null {
+  if (previous <= 0) return current > 0 ? 100 : null;
+  return ((current - previous) / previous) * 100;
+}
+
+const PAYMENT_COLORS: Record<PaymentMode, string> = {
+  Cash: 'bg-emerald-700',
+  Mpesa: 'bg-sky-700',
+  Credit: 'bg-amber-600',
+};
+
+function csvEscape(value: string | number | undefined): string {
+  const text = String(value ?? '');
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+export const MonthlyReportsView: React.FC<MonthlyReportsViewProps> = ({ settings, meta, showToast }) => {
+  const currency = settings.currency;
+  const [preset, setPreset] = useState<Preset>('7d');
+  const [range, setRange] = useState<Range>(() => presetRange('7d', meta.today));
+  const [draftFrom, setDraftFrom] = useState(range.from);
+  const [draftTo, setDraftTo] = useState(range.to);
+  const [report, setReport] = useState<ReportData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [exporting, setExporting] = useState(false);
+
+  const load = async (next: Range) => {
+    setLoading(true);
+    setError('');
+    try {
+      const result = await api<{ report: ReportData }>(
+        withQuery('/api/reports', { from: next.from, to: next.to }),
+      );
+      setReport(result.report);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Could not load the report.');
+      setReport(null);
+    } finally {
+      setLoading(false);
     }
+  };
 
-    const productMap = new Map<string, { name: string; category: string; units: number; revenue: number }>();
-    const dailyMap = new Map<string, number>();
+  useEffect(() => {
+    void load(range);
+  }, [range.from, range.to]);
 
-    for (const tx of monthTransactions) {
-      totalRevenue += tx.totalAmount;
-      if (tx.paymentMode === 'Cash') cashTotal += tx.totalAmount;
-      if (tx.paymentMode === 'Mpesa') mpesaTotal += tx.totalAmount;
-      if (tx.paymentMode === 'Credit') creditTotal += tx.totalAmount;
+  const applyPreset = (next: Preset) => {
+    setPreset(next);
+    if (next === 'custom') return;
+    const nextRange = presetRange(next, meta.today);
+    setRange(nextRange);
+    setDraftFrom(nextRange.from);
+    setDraftTo(nextRange.to);
+  };
 
-      const day = tx.createdAt.slice(0, 10);
-      dailyMap.set(day, (dailyMap.get(day) ?? 0) + tx.totalAmount);
+  const applyCustom = () => {
+    if (!draftFrom || !draftTo) {
+      showToast('Choose both start and end dates.', 'error');
+      return;
+    }
+    if (draftFrom > draftTo) {
+      showToast('The start date must be before the end date.', 'error');
+      return;
+    }
+    setPreset('custom');
+    setRange({ from: draftFrom, to: draftTo });
+  };
 
-      for (const item of tx.items) {
-        unitsSold += item.quantity;
-        totalCost += item.costPrice * item.quantity;
+  const dailyMax = useMemo(
+    () => Math.max(1, ...(report?.daily.map((point) => Math.max(point.sales, point.refunds)) ?? [1])),
+    [report],
+  );
 
-        const catEntry = categoryMap.get(item.category) ?? { revenue: 0, units: 0 };
-        catEntry.revenue += item.unitPrice * item.quantity;
-        catEntry.units += item.quantity;
-        categoryMap.set(item.category, catEntry);
+  const paymentTotal = useMemo(
+    () => report?.paymentMix.reduce((sum, entry) => sum + entry.amount, 0) ?? 0,
+    [report],
+  );
 
-        const pEntry = productMap.get(item.productId) ?? {
-          name: item.productName,
-          category: item.category,
-          units: 0,
-          revenue: 0,
-        };
-        pEntry.units += item.quantity;
-        pEntry.revenue += item.unitPrice * item.quantity;
-        productMap.set(item.productId, pEntry);
+  const exportCsv = async () => {
+    if (!report) return;
+    setExporting(true);
+    try {
+      const result = await api<{ sales: SaleTransaction[]; total: number }>(
+        withQuery('/api/sales', { from: range.from, to: range.to, limit: 200 }),
+      );
+      const header = [
+        'Receipt',
+        'Business date',
+        'Created at',
+        'Cashier',
+        'Payment',
+        'Status',
+        'Subtotal',
+        'Discount',
+        'Total',
+        'M-Pesa code',
+      ];
+      const rows = result.sales.map((sale) => [
+        sale.receiptNo,
+        sale.businessDate,
+        sale.createdAt,
+        sale.cashier,
+        sale.paymentMode,
+        sale.status,
+        sale.subtotalAmount,
+        sale.discountAmount,
+        sale.totalAmount,
+        sale.mpesaDetails?.transactionCode ?? '',
+      ]);
+      const csv = [header, ...rows].map((row) => row.map(csvEscape).join(',')).join('\r\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `whispers-sales-${range.from}-to-${range.to}.csv`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      if (result.total > result.sales.length) {
+        showToast(`CSV exported with the latest ${result.sales.length} of ${result.total} sales.`, 'info');
+      } else {
+        showToast('CSV exported.');
       }
+    } catch (caught) {
+      showToast(caught instanceof Error ? caught.message : 'Could not export sales.', 'error');
+    } finally {
+      setExporting(false);
     }
+  };
 
-    const grossProfit = totalRevenue - totalCost;
-    const marginPct = totalRevenue > 0 ? Math.round((grossProfit / totalRevenue) * 100) : 0;
+  const netChange = report ? change(report.totals.netSales, report.previous.netSales) : null;
+  const profitChange = report ? change(report.totals.grossProfit, report.previous.grossProfit) : null;
+  const countChange = report ? change(report.totals.salesCount, report.previous.salesCount) : null;
 
-    const dailySeries = Array.from(dailyMap.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([date, amount]) => ({ date, amount }));
-
-    const categoryRows = Array.from(categoryMap.entries())
-      .map(([category, val]) => ({ category, ...val }))
-      .filter((r) => r.units > 0)
-      .sort((a, b) => b.revenue - a.revenue);
-
-    const topProducts = Array.from(productMap.values()).sort((a, b) => b.units - a.units);
-
-    return {
-      totalRevenue,
-      grossProfit,
-      marginPct,
-      cashTotal,
-      mpesaTotal,
-      creditTotal,
-      unitsSold,
-      dailySeries,
-      categoryRows,
-      topProducts,
-    };
-  }, [monthTransactions]);
-
-  const maxDaily = Math.max(1, ...metrics.dailySeries.map((d) => d.amount));
-
-  const handleExportCsv = () => {
-    const header = ['Receipt', 'Date', 'Payment Mode', 'M-Pesa Code', 'Items', 'Total'];
-    const rows = monthTransactions.map((tx) => [
-      tx.receiptNo,
-      tx.createdAt.slice(0, 16).replace('T', ' '),
-      tx.paymentMode,
-      tx.mpesaDetails?.transactionCode ?? '',
-      `"${tx.items.map((i) => `${i.quantity}x ${i.productName}`).join('; ')}"`,
-      String(tx.totalAmount),
-    ]);
-    const csv = [header.join(','), ...rows.map((r) => r.join(','))].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `whispers-cosmetics-report-${selectedMonth}.csv`;
-    link.click();
-    URL.revokeObjectURL(url);
+  const renderDelta = (value: number | null) => {
+    if (value === null) return <span className="text-stone-400">No prior data</span>;
+    const positive = value >= 0;
+    return (
+      <span
+        className={cn(
+          'inline-flex items-center gap-0.5 font-medium',
+          positive ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-600 dark:text-red-400',
+        )}
+      >
+        {positive ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
+        {percent(value)} vs previous
+      </span>
+    );
   };
 
   return (
-    <div className="space-y-6">
-      {/* Controls */}
-      <div className="flex flex-wrap items-center justify-between gap-3 no-print">
-        <div className="flex items-center gap-3">
-          <label className="text-xs font-medium text-stone-600 dark:text-zinc-400">
-            Reporting Month:
-          </label>
+    <div className="space-y-5">
+      <SectionHeading
+        title="Reports"
+        description={`${dateOnly(range.from)} – ${dateOnly(range.to)} · ${meta.timezone}`}
+        action={
+          <div className="flex gap-2">
+            <Button variant="secondary" onClick={() => void load(range)} disabled={loading}>
+              <RefreshCw className={cn('w-4 h-4', loading && 'animate-spin')} /> Refresh
+            </Button>
+            <Button variant="secondary" onClick={() => void exportCsv()} loading={exporting} disabled={!report}>
+              <Download className="w-4 h-4" /> Export CSV
+            </Button>
+          </div>
+        }
+      />
+
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap gap-1.5">
+          {(
+            [
+              { id: 'today', label: 'Today' },
+              { id: 'yesterday', label: 'Yesterday' },
+              { id: '7d', label: 'Last 7 days' },
+              { id: '30d', label: 'Last 30 days' },
+              { id: 'month', label: 'This month' },
+              { id: 'lastMonth', label: 'Last month' },
+            ] as Array<{ id: Preset; label: string }>
+          ).map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              onClick={() => applyPreset(option.id)}
+              className={cn(
+                'px-3 py-1.5 rounded-full border text-xs font-medium cursor-pointer',
+                preset === option.id
+                  ? 'bg-rose-900 border-rose-900 text-white'
+                  : 'border-stone-200 dark:border-zinc-700 text-stone-600 dark:text-zinc-300 hover:bg-stone-100 dark:hover:bg-zinc-800',
+              )}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-1.5 ml-auto">
           <input
-            type="month"
-            value={selectedMonth}
-            onChange={(e) => setSelectedMonth(e.target.value)}
-            className="px-3.5 py-2 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-xs font-mono-num text-stone-900 dark:text-zinc-100"
+            type="date"
+            value={draftFrom}
+            max={draftTo || meta.today}
+            onChange={(event) => setDraftFrom(event.target.value)}
+            className="px-2 py-1.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-xs"
           />
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={handleExportCsv}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:bg-stone-100 dark:hover:bg-zinc-800 text-xs font-medium text-stone-800 dark:text-zinc-200 cursor-pointer whitespace-nowrap"
-          >
-            <Download className="w-3.5 h-3.5" />
-            <span>Export CSV</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => window.print()}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 text-white text-xs font-semibold cursor-pointer whitespace-nowrap"
-          >
-            <Printer className="w-3.5 h-3.5" />
-            <span>Print Monthly Report</span>
-          </button>
+          <span className="text-xs text-stone-400">to</span>
+          <input
+            type="date"
+            value={draftTo}
+            min={draftFrom}
+            max={meta.today}
+            onChange={(event) => setDraftTo(event.target.value)}
+            className="px-2 py-1.5 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-xs"
+          />
+          <Button size="sm" variant="secondary" onClick={applyCustom}>
+            Apply
+          </Button>
         </div>
       </div>
 
-      {/* Summary KPIs */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">Monthly Revenue</p>
-          <p className="mt-2 text-2xl font-semibold font-mono-num text-stone-900 dark:text-zinc-50">
-            {settings.currency} {metrics.totalRevenue.toLocaleString()}
-          </p>
-          <p className="mt-1 text-xs text-stone-500 dark:text-zinc-400 font-mono-num">
-            {monthTransactions.length} receipts · {metrics.unitsSold} units
-          </p>
+      {error ? (
+        <div className="rounded-xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/30 p-4 text-sm text-red-700 dark:text-red-300 flex items-center justify-between gap-3">
+          <span>{error}</span>
+          <Button size="sm" variant="secondary" onClick={() => void load(range)}>
+            Retry
+          </Button>
         </div>
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">Gross Profit</p>
-          <p className="mt-2 text-2xl font-semibold font-mono-num text-emerald-700 dark:text-emerald-400">
-            {settings.currency} {metrics.grossProfit.toLocaleString()}
-          </p>
-          <p className="mt-1 text-xs text-stone-500 dark:text-zinc-400 font-mono-num">
-            {metrics.marginPct}% average margin
-          </p>
-        </div>
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">M-Pesa Collections</p>
-          <p className="mt-2 text-2xl font-semibold font-mono-num text-stone-900 dark:text-zinc-50">
-            {settings.currency} {metrics.mpesaTotal.toLocaleString()}
-          </p>
-          <p className="mt-1 text-xs text-stone-500 dark:text-zinc-400 font-mono-num">
-            {metrics.totalRevenue > 0
-              ? Math.round((metrics.mpesaTotal / metrics.totalRevenue) * 100)
-              : 0}
-            % of monthly sales
-          </p>
-        </div>
-        <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
-          <p className="text-xs font-medium text-stone-500 dark:text-zinc-400">Cash &amp; Credit Split</p>
-          <p className="mt-2 text-2xl font-semibold font-mono-num text-stone-900 dark:text-zinc-50">
-            {settings.currency} {metrics.cashTotal.toLocaleString()}
-          </p>
-          <p className="mt-1 text-xs text-stone-500 dark:text-zinc-400 font-mono-num">
-            Credit issued: {settings.currency} {metrics.creditTotal.toLocaleString()}
-          </p>
-        </div>
-      </div>
+      ) : loading && !report ? (
+        <Spinner label="Building report…" className="py-24" />
+      ) : report ? (
+        <>
+          <div className="grid grid-cols-2 xl:grid-cols-4 gap-3">
+            <StatCard
+              label="Net sales"
+              value={money(report.totals.netSales, currency)}
+              sub={undefined}
+              icon={<TrendingUp className="w-4 h-4" />}
+              accent="rose"
+            />
+            <StatCard
+              label="Gross profit"
+              value={money(report.totals.grossProfit, currency)}
+              sub={`COGS ${money(report.totals.costOfGoods, currency)}`}
+              icon={<BarChart3 className="w-4 h-4" />}
+              accent="emerald"
+            />
+            <StatCard
+              label="Transactions"
+              value={String(report.totals.salesCount)}
+              sub={`Average ${money(report.totals.averageSale, currency)}`}
+              icon={<TrendingUp className="w-4 h-4" />}
+              accent="sky"
+            />
+            <StatCard
+              label="Refunds"
+              value={money(report.totals.refunds, currency)}
+              sub={`Discounts ${money(report.totals.discounts, currency)}`}
+              icon={<ArrowDownRight className="w-4 h-4" />}
+              accent="amber"
+            />
+          </div>
 
-      {/* Daily Performance Chart + Category Breakdown */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <section className="lg:col-span-7 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-          <h2 className="text-sm font-semibold text-stone-900 dark:text-zinc-100 mb-4">
-            Daily Sales Performance ({selectedMonth})
-          </h2>
-          {metrics.dailySeries.length === 0 ? (
-            <p className="text-xs text-stone-500 dark:text-zinc-400 py-12 text-center">
-              No sales recorded in {selectedMonth}.
-            </p>
-          ) : (
-            <div className="space-y-3">
-              <div className="h-44 flex items-end gap-3 pt-4 border-b border-stone-200 dark:border-zinc-800 pb-2">
-                {metrics.dailySeries.map((day) => {
-                  const pct = Math.max(8, Math.round((day.amount / maxDaily) * 100));
+          <div className="grid sm:grid-cols-3 gap-3 text-xs rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3">
+            <div>
+              <p className="text-stone-500 dark:text-zinc-400">Sales growth</p>
+              <p className="mt-0.5">{renderDelta(netChange)}</p>
+            </div>
+            <div>
+              <p className="text-stone-500 dark:text-zinc-400">Profit growth</p>
+              <p className="mt-0.5">{renderDelta(profitChange)}</p>
+            </div>
+            <div>
+              <p className="text-stone-500 dark:text-zinc-400">Traffic</p>
+              <p className="mt-0.5">{renderDelta(countChange)}</p>
+            </div>
+          </div>
+
+          <div className="grid lg:grid-cols-3 gap-4">
+            <section className="lg:col-span-2 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+              <SectionHeading title="Daily sales" description="Bars show revenue, amber shows refunds" />
+              <div className="h-52 flex items-end gap-1.5 overflow-x-auto pb-1">
+                {report.daily.map((point) => {
+                  const height = Math.max(3, Math.round((point.sales / dailyMax) * 160));
                   return (
-                    <div key={day.date} className="flex-1 flex flex-col items-center gap-1.5 min-w-0">
-                      <span className="text-[10px] font-mono-num text-stone-500 dark:text-zinc-400 truncate">
-                        {day.amount.toLocaleString()}
-                      </span>
-                      <div className="w-full max-w-[40px] h-28 flex items-end">
+                    <div key={point.date} className="flex-1 min-w-[18px] flex flex-col items-center gap-1">
+                      <div className="h-40 w-full flex items-end justify-center">
                         <div
-                          style={{ height: `${pct}%` }}
-                          className="w-full rounded-t-md bg-rose-900/85 dark:bg-rose-600 transition-all"
-                        />
+                          className="relative w-full max-w-8 rounded-t bg-rose-800/90"
+                          style={{ height }}
+                          title={`${dateOnly(point.date)} · ${money(point.sales, currency)} · ${point.transactions} sale(s)`}
+                        >
+                          {point.refunds > 0 && (
+                            <span
+                              className="absolute bottom-0 inset-x-0 bg-amber-500/90 rounded-t-sm"
+                              style={{ height: Math.max(2, Math.round((point.refunds / dailyMax) * 160)) }}
+                            />
+                          )}
+                        </div>
                       </div>
-                      <span className="text-[11px] font-mono-num text-stone-500 dark:text-zinc-400">
-                        {day.date.slice(5)}
+                      <span className="text-[9px] text-stone-400 whitespace-nowrap">
+                        {point.date.slice(5)}
                       </span>
                     </div>
                   );
                 })}
               </div>
-            </div>
-          )}
-        </section>
+            </section>
 
-        <section className="lg:col-span-5 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-          <h2 className="text-sm font-semibold text-stone-900 dark:text-zinc-100 mb-4">
-            Category Performance
-          </h2>
-          {metrics.categoryRows.length === 0 ? (
-            <p className="text-xs text-stone-500 dark:text-zinc-400 py-10 text-center">
-              No category data for this period.
-            </p>
-          ) : (
-            <div className="space-y-3">
-              {metrics.categoryRows.map((row) => {
-                const share =
-                  metrics.totalRevenue > 0
-                    ? Math.round((row.revenue / metrics.totalRevenue) * 100)
-                    : 0;
-                return (
-                  <div key={row.category} className="space-y-1">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-medium text-stone-800 dark:text-zinc-200">
-                        {row.category}
-                      </span>
-                      <span className="font-mono-num text-stone-600 dark:text-zinc-400">
-                        {row.units} units · {settings.currency} {row.revenue.toLocaleString()}
-                      </span>
+            <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+              <SectionHeading title="Payment mix" description="Revenue share in range" />
+              <div className="space-y-4">
+                {report.paymentMix.map((entry) => {
+                  const share = paymentTotal > 0 ? (entry.amount / paymentTotal) * 100 : 0;
+                  return (
+                    <div key={entry.mode}>
+                      <div className="flex justify-between text-xs mb-1.5">
+                        <span className="font-medium">{entry.mode}</span>
+                        <span className="font-mono text-stone-500 dark:text-zinc-400">
+                          {money(entry.amount, currency)} · {Math.round(share)}%
+                        </span>
+                      </div>
+                      <div className="h-2 rounded-full bg-stone-100 dark:bg-zinc-800 overflow-hidden">
+                        <div
+                          className={cn('h-full rounded-full', PAYMENT_COLORS[entry.mode])}
+                          style={{ width: `${Math.max(2, share)}%` }}
+                        />
+                      </div>
+                      <p className="text-[10px] text-stone-400 mt-1">{entry.count} sale(s)</p>
                     </div>
-                    <div className="h-1.5 w-full rounded-full bg-stone-100 dark:bg-zinc-800 overflow-hidden">
-                      <div
-                        style={{ width: `${share}%` }}
-                        className="h-full bg-rose-900 dark:bg-rose-600 rounded-full"
-                      />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
-      </div>
-
-      {/* Top Products & Transaction Ledger */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-          <h2 className="text-sm font-semibold text-stone-900 dark:text-zinc-100 mb-4">
-            Best-Selling Products
-          </h2>
-          <div className="divide-y divide-stone-100 dark:divide-zinc-800 text-xs">
-            {metrics.topProducts.map((p, idx) => (
-              <div key={idx} className="py-2.5 first:pt-0 last:pb-0 flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="font-medium text-stone-900 dark:text-zinc-100 truncate">{p.name}</p>
-                  <p className="text-stone-500 dark:text-zinc-400">{p.category}</p>
+                  );
+                })}
+              </div>
+              <div className="mt-5 pt-4 border-t border-stone-100 dark:border-zinc-800 grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <p className="text-stone-500 dark:text-zinc-400">Credit collected</p>
+                  <p className="font-mono font-semibold mt-0.5">{money(report.creditCollected, currency)}</p>
                 </div>
-                <div className="text-right font-mono-num shrink-0">
-                  <p className="font-semibold text-stone-900 dark:text-zinc-100">{p.units} sold</p>
-                  <p className="text-stone-500 dark:text-zinc-400">
-                    {settings.currency} {p.revenue.toLocaleString()}
+                <div>
+                  <p className="text-stone-500 dark:text-zinc-400">Overdue credit</p>
+                  <p className="font-mono font-semibold mt-0.5 text-amber-700 dark:text-amber-400">
+                    {money(report.overdueCredit, currency)}
                   </p>
                 </div>
               </div>
-            ))}
+            </section>
           </div>
-        </section>
 
-        <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-          <h2 className="text-sm font-semibold text-stone-900 dark:text-zinc-100 mb-4">
-            Transaction &amp; M-Pesa Reconciliation Log
-          </h2>
-          <div className="divide-y divide-stone-100 dark:divide-zinc-800 text-xs max-h-80 overflow-y-auto pr-1">
-            {monthTransactions.map((tx) => (
-              <div key={tx.id} className="py-3 first:pt-0 last:pb-0 space-y-1">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold font-mono-num text-stone-900 dark:text-zinc-100">
-                    {tx.receiptNo} · {tx.paymentMode}
-                  </span>
-                  <span className="font-semibold font-mono-num text-stone-900 dark:text-zinc-100">
-                    {settings.currency} {tx.totalAmount.toLocaleString()}
-                  </span>
-                </div>
-                <p className="text-stone-500 dark:text-zinc-400">
-                  {new Date(tx.createdAt).toLocaleString()}
-                </p>
-                {tx.mpesaDetails?.rawMessage && (
-                  <p className="text-[11px] bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-900 dark:text-emerald-300 rounded-md px-2.5 py-1.5 border border-emerald-200/70 dark:border-emerald-900/50">
-                    M-Pesa SMS: {tx.mpesaDetails.rawMessage}
-                  </p>
-                )}
-              </div>
-            ))}
+          <div className="grid lg:grid-cols-2 gap-4">
+            <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+              <SectionHeading title="Top products" description="By revenue in range" />
+              {report.topProducts.length === 0 ? (
+                <EmptyState title="No products sold in this range" icon={<BarChart3 className="w-5 h-5" />} />
+              ) : (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-[11px] uppercase tracking-wider text-stone-500 dark:text-zinc-400">
+                      <th className="py-1.5 font-semibold">Product</th>
+                      <th className="py-1.5 font-semibold text-right">Units</th>
+                      <th className="py-1.5 font-semibold text-right">Revenue</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-stone-100 dark:divide-zinc-800">
+                    {report.topProducts.slice(0, 10).map((row) => (
+                      <tr key={row.productId}>
+                        <td className="py-2 pr-2 truncate max-w-[200px] text-xs">{row.name}</td>
+                        <td className="py-2 text-right font-mono text-xs">{row.quantity}</td>
+                        <td className="py-2 text-right font-mono text-xs font-semibold">
+                          {money(row.revenue, currency)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </section>
+
+            <section className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5">
+              <SectionHeading title="Refund log" description={`${report.refunds.length} refund(s) in range`} />
+              {report.refunds.length === 0 ? (
+                <EmptyState title="No refunds in this range" icon={<ArrowDownRight className="w-5 h-5" />} />
+              ) : (
+                <ul className="divide-y divide-stone-100 dark:divide-zinc-800 max-h-[340px] overflow-y-auto">
+                  {report.refunds.slice(0, 20).map((refund) => (
+                    <li key={refund.id} className="py-2.5 flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-xs font-medium">
+                          <span className="font-mono">{refund.refundNo}</span> · {refund.saleReceiptNo}
+                        </p>
+                        <p className="text-[11px] text-stone-500 dark:text-zinc-400 truncate">{refund.reason}</p>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <p className="font-mono text-xs font-semibold">{money(refund.totalAmount, currency)}</p>
+                        <Badge tone={refund.restocked ? 'green' : 'neutral'} className="mt-0.5">
+                          {refund.method}
+                        </Badge>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
           </div>
-        </section>
-      </div>
+
+          <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3 text-[11px] text-stone-500 dark:text-zinc-400">
+            Comparing {dateOnly(report.previousFrom)} – {dateOnly(report.previousTo)}: net{' '}
+            {money(report.previous.netSales, currency)}, profit {money(report.previous.grossProfit, currency)},{' '}
+            {report.previous.salesCount} transaction(s).
+          </div>
+        </>
+      ) : null}
     </div>
   );
 };

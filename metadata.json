@@ -1,6 +1,6 @@
 {
-  "name": "Whispers Cosmetics",
-  "description": "Inventory management, barcode POS, M-Pesa reconciliation, dynamic pricing, and credit tracking system for Whispers Cosmetics.",
+  "name": "Whispers Cosmetics POS",
+  "description": "Cosmetics point of sale with barcode checkout, stock ledger, M-Pesa Daraja payments, refunds, customer credit and daily/monthly reports.",
   "requestFramePermissions": ["camera"],
   "majorCapabilities": []
 }

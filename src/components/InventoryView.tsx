@@ -1,379 +1,590 @@
 import React, { useMemo, useState } from 'react';
 import {
-  AlertTriangle,
-  Check,
-  Edit3,
+  Archive,
+  ArchiveRestore,
+  History,
+  Package,
+  PackagePlus,
+  Pencil,
   Plus,
   Search,
-  Trash2,
-  TrendingUp,
-  X,
+  SlidersHorizontal,
 } from 'lucide-react';
-import {
-  PRODUCT_CATEGORIES,
-  Product,
-  ProductCategory,
-  SaleTransaction,
-  StoreSettings,
-} from '../types';
-import { computeDynamicRecommendation, getExpiryStatus } from '../lib/dynamicPricing';
+import type { Product, StockMovement, StoreSettings } from '../types';
+import { api, withQuery } from '../lib/api';
+import { cn, dateTime, money, moneyExact } from '../lib/format';
+import { getExpiryStatus } from '../lib/dynamicPricing';
+import { Badge, Button, EmptyState, Modal, SectionHeading, Spinner } from './ui';
 import { ProductThumbnail } from './ProductThumbnail';
-import { ProductFormView } from './ProductFormView';
 
 interface InventoryViewProps {
   products: Product[];
-  transactions: SaleTransaction[];
   settings: StoreSettings;
-  onUpdateProduct: (id: string, data: Partial<Product>) => Promise<void>;
-  onDeleteProduct: (id: string) => Promise<void>;
-  onGoToAddProduct: () => void;
+  onRefresh: () => Promise<void>;
+  onAdd: () => void;
+  onEdit: (product: Product) => void;
+  showToast: (message: string, kind?: 'success' | 'error' | 'info') => void;
 }
 
-type AlertFilter = 'all' | 'low_stock' | 'expiring' | 'dynamic';
+type StockFilter = 'all' | 'low' | 'out' | 'expiring';
+
+const MOVEMENT_LABELS: Record<string, string> = {
+  opening: 'Opening stock',
+  sale: 'Sale',
+  refund: 'Refund',
+  restock: 'Restock',
+  adjustment: 'Adjustment',
+  credit: 'Credit sale',
+};
 
 export const InventoryView: React.FC<InventoryViewProps> = ({
   products,
-  transactions,
   settings,
-  onUpdateProduct,
-  onDeleteProduct,
-  onGoToAddProduct,
+  onRefresh,
+  onAdd,
+  onEdit,
+  showToast,
 }) => {
+  const currency = settings.currency;
   const [search, setSearch] = useState('');
-  const [categoryFilter, setCategoryFilter] = useState<ProductCategory | 'All'>('All');
-  const [alertFilter, setAlertFilter] = useState<AlertFilter>('all');
-  const [editingProduct, setEditingProduct] = useState<Product | null>(null);
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [category, setCategory] = useState('All');
+  const [stockFilter, setStockFilter] = useState<StockFilter>('all');
+  const [showArchived, setShowArchived] = useState(false);
 
-  const enrichedProducts = useMemo(() => {
-    return products.map((p) => ({
-      product: p,
-      rec: computeDynamicRecommendation(p, transactions),
-      expiry: getExpiryStatus(p),
-      isLowStock: p.stock <= p.reorderLevel,
-    }));
-  }, [products, transactions]);
+  const [restockTarget, setRestockTarget] = useState<Product | null>(null);
+  const [restockQty, setRestockQty] = useState('');
+  const [restockCost, setRestockCost] = useState('');
+  const [restockNote, setRestockNote] = useState('');
+  const [restockBusy, setRestockBusy] = useState(false);
+
+  const [adjustTarget, setAdjustTarget] = useState<Product | null>(null);
+  const [adjustCount, setAdjustCount] = useState('');
+  const [adjustNote, setAdjustNote] = useState('');
+  const [adjustBusy, setAdjustBusy] = useState(false);
+
+  const [historyTarget, setHistoryTarget] = useState<Product | null>(null);
+  const [history, setHistory] = useState<StockMovement[] | null>(null);
+
+  const [archiving, setArchiving] = useState<string | null>(null);
+
+  const active = products.filter((product) => !product.archived);
+  const categories = useMemo(
+    () => ['All', ...Array.from(new Set(products.map((product) => product.category)))],
+    [products],
+  );
+
+  const stats = useMemo(() => {
+    const low = active.filter((product) => product.stock > 0 && product.stock <= product.reorderLevel).length;
+    const out = active.filter((product) => product.stock === 0).length;
+    const value = active.reduce((sum, product) => sum + product.costPrice * product.stock, 0);
+    return { low, out, value };
+  }, [active]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return enrichedProducts.filter(({ product, rec, expiry, isLowStock }) => {
-      if (categoryFilter !== 'All' && product.category !== categoryFilter) return false;
-      if (alertFilter === 'low_stock' && !isLowStock) return false;
-      if (alertFilter === 'expiring' && expiry.level !== 'soon' && expiry.level !== 'expired')
-        return false;
-      if (alertFilter === 'dynamic' && !rec.needsAdjustment) return false;
-
-      if (q) {
-        const hit =
-          product.name.toLowerCase().includes(q) ||
-          product.brand.toLowerCase().includes(q) ||
-          product.category.toLowerCase().includes(q);
-        if (!hit) return false;
+    const term = search.trim().toLowerCase();
+    return products.filter((product) => {
+      if (!showArchived && product.archived) return false;
+      if (showArchived && !product.archived) return false;
+      if (category !== 'All' && product.category !== category) return false;
+      if (stockFilter === 'low' && !(product.stock > 0 && product.stock <= product.reorderLevel)) return false;
+      if (stockFilter === 'out' && product.stock !== 0) return false;
+      if (stockFilter === 'expiring') {
+        const expiry = getExpiryStatus(product);
+        if (expiry.level !== 'soon' && expiry.level !== 'expired') return false;
       }
-      return true;
+      if (!term) return true;
+      return (
+        product.name.toLowerCase().includes(term) ||
+        product.brand.toLowerCase().includes(term) ||
+        product.sku.toLowerCase().includes(term) ||
+        product.barcode.toLowerCase().includes(term)
+      );
     });
-  }, [enrichedProducts, categoryFilter, alertFilter, search]);
+  }, [products, search, category, stockFilter, showArchived]);
 
-  const applyAllDynamic = async () => {
-    const targets = enrichedProducts.filter((e) => e.rec.needsAdjustment);
-    for (const t of targets) {
-      await onUpdateProduct(t.product.id, { currentPrice: t.rec.suggestedPrice });
+  const openRestock = (product: Product) => {
+    setRestockTarget(product);
+    setRestockQty('');
+    setRestockCost(String(product.costPrice));
+    setRestockNote('');
+  };
+
+  const openAdjust = (product: Product) => {
+    setAdjustTarget(product);
+    setAdjustCount(String(product.stock));
+    setAdjustNote('');
+  };
+
+  const openHistory = async (product: Product) => {
+    setHistoryTarget(product);
+    setHistory(null);
+    try {
+      const result = await api<{ movements: StockMovement[] }>(
+        withQuery(`/api/products/${product.id}/movements`, { limit: 100 }),
+      );
+      setHistory(result.movements);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not load stock history.', 'error');
+      setHistoryTarget(null);
+    }
+  };
+
+  const submitRestock = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!restockTarget) return;
+    const quantity = Number.parseInt(restockQty, 10);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      showToast('Enter the number of units received.', 'error');
+      return;
+    }
+    setRestockBusy(true);
+    try {
+      await api(`/api/products/${restockTarget.id}/restock`, {
+        method: 'POST',
+        body: {
+          quantity,
+          unitCost: restockCost.trim() || undefined,
+          note: restockNote.trim() || undefined,
+        },
+      });
+      await onRefresh();
+      showToast(`${quantity} unit(s) added to ${restockTarget.name}.`);
+      setRestockTarget(null);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Restock failed.', 'error');
+    } finally {
+      setRestockBusy(false);
+    }
+  };
+
+  const submitAdjust = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!adjustTarget) return;
+    const counted = Number.parseInt(adjustCount, 10);
+    if (!Number.isFinite(counted) || counted < 0) {
+      showToast('Enter the counted stock level.', 'error');
+      return;
+    }
+    setAdjustBusy(true);
+    try {
+      await api(`/api/products/${adjustTarget.id}/adjust-stock`, {
+        method: 'POST',
+        body: { countedStock: counted, note: adjustNote.trim() || undefined },
+      });
+      await onRefresh();
+      showToast(`Stock count updated for ${adjustTarget.name}.`);
+      setAdjustTarget(null);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Stock adjustment failed.', 'error');
+    } finally {
+      setAdjustBusy(false);
+    }
+  };
+
+  const toggleArchive = async (product: Product) => {
+    setArchiving(product.id);
+    try {
+      await api(`/api/products/${product.id}/archive`, {
+        method: 'POST',
+        body: { archived: !product.archived },
+      });
+      await onRefresh();
+      showToast(product.archived ? `${product.name} restored.` : `${product.name} archived.`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not update the product.', 'error');
+    } finally {
+      setArchiving(null);
     }
   };
 
   return (
     <div className="space-y-5">
-      {/* Toolbar */}
-      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-        <div className="flex flex-col sm:flex-row gap-2.5 flex-1">
-          <div className="relative flex-1 max-w-md">
-            <Search className="w-4 h-4 text-stone-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search by product name, brand, or category..."
-              className="w-full pl-10 pr-4 py-2 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-sm text-stone-900 dark:text-zinc-100 placeholder:text-stone-400"
-            />
+      <SectionHeading
+        title="Inventory"
+        description={`${active.length} active · ${money(stats.value, currency)} at cost · ${stats.low} low · ${stats.out} out`}
+        action={
+          <Button onClick={onAdd}>
+            <Plus className="w-4 h-4" /> Add product
+          </Button>
+        }
+      />
+
+      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        {[
+          { label: 'Active products', value: String(active.length), tone: 'text-stone-900 dark:text-zinc-100' },
+          { label: 'Stock value (cost)', value: money(stats.value, currency), tone: 'text-stone-900 dark:text-zinc-100' },
+          { label: 'Low stock', value: String(stats.low), tone: 'text-amber-700 dark:text-amber-400' },
+          { label: 'Out of stock', value: String(stats.out), tone: 'text-red-600 dark:text-red-400' },
+        ].map((card) => (
+          <div
+            key={card.label}
+            className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3"
+          >
+            <p className="text-[11px] uppercase tracking-wider font-semibold text-stone-500 dark:text-zinc-400">
+              {card.label}
+            </p>
+            <p className={cn('font-mono text-lg font-semibold mt-1', card.tone)}>{card.value}</p>
           </div>
-
-          <select
-            value={categoryFilter}
-            onChange={(e) => setCategoryFilter(e.target.value as ProductCategory | 'All')}
-            className="px-3.5 py-2 rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-xs font-medium text-stone-800 dark:text-zinc-200"
-          >
-            <option value="All">All Categories ({products.length})</option>
-            {PRODUCT_CATEGORIES.map((cat) => (
-              <option key={cat} value={cat}>
-                {cat}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="flex items-center gap-2">
-          {enrichedProducts.some((e) => e.rec.needsAdjustment) && (
-            <button
-              type="button"
-              onClick={() => void applyAllDynamic()}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/30 text-xs font-medium text-rose-900 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-950/50 transition-colors cursor-pointer whitespace-nowrap"
-            >
-              <TrendingUp className="w-3.5 h-3.5" />
-              <span>Sync All Dynamic Prices</span>
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={onGoToAddProduct}
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-900 hover:bg-rose-800 dark:bg-rose-700 dark:hover:bg-rose-600 text-white text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap"
-          >
-            <Plus className="w-4 h-4" />
-            <span>New Listing</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Alert Filter Segmented Bar */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        {(
-          [
-            { id: 'all', label: 'All Stock' },
-            { id: 'low_stock', label: 'Reorder Alerts' },
-            { id: 'expiring', label: 'Expiry Watch' },
-            { id: 'dynamic', label: 'Price Suggestions' },
-          ] as const
-        ).map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            onClick={() => setAlertFilter(tab.id)}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
-              alertFilter === tab.id
-                ? 'bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
-                : 'bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-800 text-stone-600 dark:text-zinc-300 hover:bg-stone-100 dark:hover:bg-zinc-800'
-            }`}
-          >
-            {tab.label}
-          </button>
         ))}
       </div>
 
-      {/* Inventory Table */}
-      <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="border-b border-stone-200 dark:border-zinc-800 text-[11px] font-semibold text-stone-500 dark:text-zinc-400 bg-stone-50/80 dark:bg-zinc-950/40">
-                <th className="py-3 px-4">Product</th>
-                <th className="py-3 px-4">Category</th>
-                <th className="py-3 px-4 text-right">Stock / Reorder</th>
-                <th className="py-3 px-4">Perishable / Expiry</th>
-                <th className="py-3 px-4 text-right">Selling Price</th>
-                <th className="py-3 px-4">Dynamic Demand</th>
-                <th className="py-3 px-4 text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-stone-100 dark:divide-zinc-800 text-xs">
-              {filtered.length === 0 ? (
-                <tr>
-                  <td colSpan={7} className="py-12 text-center text-stone-500 dark:text-zinc-400">
-                    No inventory items match the selected filter.
-                  </td>
-                </tr>
-              ) : (
-                filtered.map(({ product, rec, expiry, isLowStock }) => (
-                  <tr
-                    key={product.id}
-                    className="hover:bg-stone-50/70 dark:hover:bg-zinc-800/30 transition-colors"
-                  >
-                    <td className="py-3 px-4">
-                      <div className="flex items-center gap-3 min-w-[210px]">
-                        <ProductThumbnail
-                          imageUrl={product.imageUrl}
-                          name={product.name}
-                          category={product.category}
-                          className="w-10 h-10 rounded-lg"
-                        />
-                        <div className="min-w-0">
-                          <p className="font-medium text-stone-900 dark:text-zinc-100 truncate max-w-[230px]">
-                            {product.name}
-                          </p>
-                          <p className="text-[11px] text-stone-500 dark:text-zinc-400">
-                            {product.brand}
-                          </p>
-                        </div>
-                      </div>
-                    </td>
-
-                    <td className="py-3 px-4 text-stone-700 dark:text-zinc-300 whitespace-nowrap">
-                      {product.category}
-                    </td>
-
-                    <td className="py-3 px-4 text-right font-mono-num whitespace-nowrap">
-                      <div className="flex flex-col items-end">
-                        <span
-                          className={`font-semibold ${
-                            product.stock === 0
-                              ? 'text-red-600 dark:text-red-400'
-                              : isLowStock
-                                ? 'text-amber-600 dark:text-amber-400'
-                                : 'text-stone-900 dark:text-zinc-100'
-                          }`}
-                        >
-                          {product.stock} units
-                        </span>
-                        <span className="text-[11px] text-stone-400 dark:text-zinc-500 flex items-center gap-1">
-                          {isLowStock && <AlertTriangle className="w-3 h-3 text-amber-500" />}
-                          Min {product.reorderLevel}
-                        </span>
-                      </div>
-                    </td>
-
-                    <td className="py-3 px-4 whitespace-nowrap">
-                      {product.isPerishable ? (
-                        <div>
-                          <p
-                            className={`font-medium ${
-                              expiry.level === 'expired'
-                                ? 'text-red-600 dark:text-red-400'
-                                : expiry.level === 'soon'
-                                  ? 'text-amber-600 dark:text-amber-400'
-                                  : 'text-emerald-700 dark:text-emerald-400'
-                            }`}
-                          >
-                            {expiry.label}
-                          </p>
-                          <p className="text-[11px] font-mono-num text-stone-400 dark:text-zinc-500">
-                            {product.expiryDate}
-                          </p>
-                        </div>
-                      ) : (
-                        <span className="text-stone-400 dark:text-zinc-500">Non-perishable</span>
-                      )}
-                    </td>
-
-                    <td className="py-3 px-4 text-right font-mono-num whitespace-nowrap">
-                      <p className="font-semibold text-stone-900 dark:text-zinc-100">
-                        {settings.currency} {product.currentPrice.toLocaleString()}
-                      </p>
-                      <p className="text-[11px] text-stone-400 dark:text-zinc-500">
-                        Base {product.basePrice.toLocaleString()} · Cost {product.costPrice.toLocaleString()}
-                      </p>
-                    </td>
-
-                    <td className="py-3 px-4 whitespace-nowrap">
-                      <div className="space-y-1">
-                        <p className="font-medium text-stone-700 dark:text-zinc-300">
-                          {rec.demandTier} ({rec.unitsSold7d} sold / 7d)
-                        </p>
-                        {rec.needsAdjustment ? (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void onUpdateProduct(product.id, { currentPrice: rec.suggestedPrice })
-                            }
-                            className="inline-flex items-center gap-1 text-[11px] font-semibold text-rose-900 dark:text-rose-400 hover:underline cursor-pointer"
-                          >
-                            <Check className="w-3 h-3" />
-                            <span>
-                              Adjust to {settings.currency} {rec.suggestedPrice.toLocaleString()} (
-                              {rec.deltaPercent >= 0 ? `+${rec.deltaPercent}%` : `${rec.deltaPercent}%`})
-                            </span>
-                          </button>
-                        ) : (
-                          <span className="text-[11px] text-stone-400 dark:text-zinc-500">
-                            Price optimal
-                          </span>
-                        )}
-                      </div>
-                    </td>
-
-                    <td className="py-3 px-4 text-right whitespace-nowrap">
-                      <div className="inline-flex items-center gap-1">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            void onUpdateProduct(product.id, { stock: product.stock + 5 })
-                          }
-                          title="Quick +5 Restock"
-                          className="px-2 py-1 rounded-md border border-stone-200 dark:border-zinc-700 hover:bg-stone-100 dark:hover:bg-zinc-800 font-mono-num text-[11px] font-medium text-stone-700 dark:text-zinc-300 cursor-pointer"
-                        >
-                          +5
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setEditingProduct(product)}
-                          title="Edit product & pricing"
-                          className="p-1.5 rounded-md text-stone-500 hover:text-stone-900 dark:text-zinc-400 dark:hover:text-zinc-100 hover:bg-stone-100 dark:hover:bg-zinc-800 cursor-pointer"
-                        >
-                          <Edit3 className="w-3.5 h-3.5" />
-                        </button>
-                        {confirmDeleteId === product.id ? (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              void onDeleteProduct(product.id);
-                              setConfirmDeleteId(null);
-                            }}
-                            className="px-2 py-1 rounded-md bg-red-600 text-white text-[11px] font-medium cursor-pointer"
-                          >
-                            Confirm
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => setConfirmDeleteId(product.id)}
-                            title="Delete product"
-                            className="p-1.5 rounded-md text-stone-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-stone-100 dark:hover:bg-zinc-800 cursor-pointer"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Edit Product Modal */}
-      {editingProduct && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] p-4 overflow-y-auto">
-          <div className="w-full max-w-4xl rounded-2xl bg-stone-50 dark:bg-zinc-950 border border-stone-200 dark:border-zinc-800 p-6 my-8 shadow-2xl">
-            <div className="flex items-center justify-between mb-5">
-              <div>
-                <h2 className="text-lg font-semibold text-stone-900 dark:text-zinc-100">
-                  Edit Goods &amp; Price Point
-                </h2>
-                <p className="text-xs text-stone-500 dark:text-zinc-400">
-                  Update inventory details, product photo, expiry date, or dynamic pricing rules.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setEditingProduct(null)}
-                className="p-2 rounded-lg text-stone-500 hover:text-stone-900 dark:text-zinc-400 dark:hover:text-zinc-100 hover:bg-stone-200/60 dark:hover:bg-zinc-800 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <ProductFormView
-              initialProduct={editingProduct}
-              settings={settings}
-              submitLabel="Save Changes"
-              onCancel={() => setEditingProduct(null)}
-              onSubmit={async (data) => {
-                await onUpdateProduct(editingProduct.id, data);
-                setEditingProduct(null);
-              }}
+      <div className="rounded-xl border border-stone-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
+        <div className="p-3 border-b border-stone-100 dark:border-zinc-800 flex flex-wrap items-center gap-2">
+          <div className="relative flex-1 min-w-[200px]">
+            <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
+            <input
+              type="search"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search name, brand, SKU or barcode…"
+              className="w-full pl-9 pr-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm focus:outline-none focus:ring-2 focus:ring-rose-800/30"
             />
           </div>
+          <select
+            value={category}
+            onChange={(event) => setCategory(event.target.value)}
+            className="px-2.5 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-xs focus:outline-none"
+          >
+            {categories.map((entry) => (
+              <option key={entry}>{entry}</option>
+            ))}
+          </select>
+          <div className="inline-flex rounded-lg border border-stone-200 dark:border-zinc-700 overflow-hidden">
+            {(
+              [
+                { id: 'all', label: 'All' },
+                { id: 'low', label: 'Low' },
+                { id: 'out', label: 'Out' },
+                { id: 'expiring', label: 'Expiring' },
+              ] as Array<{ id: StockFilter; label: string }>
+            ).map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => setStockFilter(option.id)}
+                className={cn(
+                  'px-2.5 py-2 text-xs font-medium cursor-pointer',
+                  stockFilter === option.id
+                    ? 'bg-rose-900 text-white'
+                    : 'text-stone-600 dark:text-zinc-300 hover:bg-stone-50 dark:hover:bg-zinc-800',
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <label className="inline-flex items-center gap-1.5 text-xs text-stone-600 dark:text-zinc-300 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(event) => setShowArchived(event.target.checked)}
+              className="accent-rose-900"
+            />
+            <Archive className="w-3.5 h-3.5" /> Archived
+          </label>
         </div>
-      )}
+
+        {filtered.length === 0 ? (
+          <EmptyState
+            icon={<Package className="w-5 h-5" />}
+            title={showArchived ? 'No archived products' : 'No products match this view'}
+            description={showArchived ? 'Archived products are kept for history and receipts.' : 'Adjust the filters or add a new product.'}
+            action={
+              !showArchived ? (
+                <Button variant="secondary" onClick={onAdd}>
+                  <Plus className="w-4 h-4" /> Add product
+                </Button>
+              ) : undefined
+            }
+          />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-[11px] uppercase tracking-wider text-stone-500 dark:text-zinc-400 border-b border-stone-100 dark:border-zinc-800">
+                  <th className="px-3 py-2 font-semibold">Product</th>
+                  <th className="px-3 py-2 font-semibold hidden md:table-cell">Barcode / SKU</th>
+                  <th className="px-3 py-2 font-semibold text-right">Stock</th>
+                  <th className="px-3 py-2 font-semibold text-right hidden sm:table-cell">Cost</th>
+                  <th className="px-3 py-2 font-semibold text-right">Price</th>
+                  <th className="px-3 py-2 font-semibold text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-100 dark:divide-zinc-800">
+                {filtered.map((product) => {
+                  const expiry = getExpiryStatus(product);
+                  return (
+                    <tr key={product.id} className="hover:bg-stone-50/70 dark:hover:bg-zinc-800/40">
+                      <td className="px-3 py-2.5">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <ProductThumbnail
+                            imageUrl={product.imageUrl}
+                            name={product.name}
+                            category={product.category}
+                            className="w-9 h-9 rounded-md"
+                          />
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium truncate max-w-[220px]">{product.name}</p>
+                            <p className="text-[11px] text-stone-500 dark:text-zinc-400 truncate">
+                              {product.category}
+                              {product.brand ? ` · ${product.brand}` : ''}
+                              {product.archived ? ' · Archived' : ''}
+                            </p>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2.5 hidden md:table-cell">
+                        <p className="font-mono text-[11px]">{product.barcode}</p>
+                        <p className="font-mono text-[10px] text-stone-400">{product.sku}</p>
+                      </td>
+                      <td className="px-3 py-2.5 text-right">
+                        <p className="font-mono text-sm">{product.stock}</p>
+                        <div className="flex justify-end gap-1 mt-0.5">
+                          {product.stock === 0 ? (
+                            <Badge tone="red">Out</Badge>
+                          ) : product.stock <= product.reorderLevel ? (
+                            <Badge tone="amber">Low</Badge>
+                          ) : null}
+                          {expiry.level === 'expired' ? (
+                            <Badge tone="red">Expired</Badge>
+                          ) : expiry.level === 'soon' ? (
+                            <Badge tone="amber">{expiry.daysLeft}d</Badge>
+                          ) : null}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2.5 text-right font-mono text-xs hidden sm:table-cell">
+                        {money(product.costPrice, currency)}
+                      </td>
+                      <td className="px-3 py-2.5 text-right">
+                        <p className="font-mono text-sm font-semibold">{money(product.currentPrice, currency)}</p>
+                        {product.currentPrice !== product.basePrice && (
+                          <p className="text-[10px] text-stone-400 line-through font-mono">
+                            {money(product.basePrice, currency)}
+                          </p>
+                        )}
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <div className="flex items-center justify-end gap-0.5">
+                          <button
+                            type="button"
+                            onClick={() => openRestock(product)}
+                            disabled={product.archived}
+                            className="p-1.5 rounded-md text-emerald-700 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/40 disabled:opacity-30 cursor-pointer"
+                            title="Restock"
+                            aria-label={`Restock ${product.name}`}
+                          >
+                            <PackagePlus className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openAdjust(product)}
+                            className="p-1.5 rounded-md text-sky-700 hover:bg-sky-50 dark:text-sky-400 dark:hover:bg-sky-950/40 cursor-pointer"
+                            title="Physical count"
+                            aria-label={`Adjust stock for ${product.name}`}
+                          >
+                            <SlidersHorizontal className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void openHistory(product)}
+                            className="p-1.5 rounded-md text-stone-500 hover:bg-stone-100 dark:text-zinc-400 dark:hover:bg-zinc-800 cursor-pointer"
+                            title="Stock history"
+                            aria-label={`History for ${product.name}`}
+                          >
+                            <History className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onEdit(product)}
+                            className="p-1.5 rounded-md text-stone-600 hover:bg-stone-100 dark:text-zinc-300 dark:hover:bg-zinc-800 cursor-pointer"
+                            title="Edit"
+                            aria-label={`Edit ${product.name}`}
+                          >
+                            <Pencil className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void toggleArchive(product)}
+                            disabled={archiving === product.id}
+                            className="p-1.5 rounded-md text-stone-500 hover:bg-red-50 hover:text-red-600 dark:text-zinc-400 dark:hover:bg-red-950/40 disabled:opacity-40 cursor-pointer"
+                            title={product.archived ? 'Restore' : 'Archive'}
+                            aria-label={product.archived ? `Restore ${product.name}` : `Archive ${product.name}`}
+                          >
+                            {product.archived ? <ArchiveRestore className="w-4 h-4" /> : <Archive className="w-4 h-4" />}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <Modal
+        open={restockTarget !== null}
+        onClose={() => setRestockTarget(null)}
+        title="Restock product"
+        subtitle={restockTarget ? `${restockTarget.name} · ${restockTarget.stock} in stock` : undefined}
+        size="sm"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setRestockTarget(null)}>
+              Cancel
+            </Button>
+            <Button type="submit" form="restock-form" loading={restockBusy}>
+              Add stock
+            </Button>
+          </>
+        }
+      >
+        <form id="restock-form" onSubmit={(event) => void submitRestock(event)} className="space-y-3">
+          <label className="block text-xs font-medium">
+            Units received
+            <input
+              type="number"
+              min={1}
+              value={restockQty}
+              onChange={(event) => setRestockQty(event.target.value)}
+              autoFocus
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600/30"
+            />
+          </label>
+          <label className="block text-xs font-medium">
+            Unit cost ({currency}) — optional
+            <input
+              type="number"
+              min={0}
+              step="0.01"
+              value={restockCost}
+              onChange={(event) => setRestockCost(event.target.value)}
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600/30"
+            />
+          </label>
+          <label className="block text-xs font-medium">
+            Note
+            <input
+              type="text"
+              value={restockNote}
+              onChange={(event) => setRestockNote(event.target.value)}
+              placeholder="Supplier, invoice number…"
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600/30"
+            />
+          </label>
+          {restockTarget && restockQty && Number.parseInt(restockQty, 10) > 0 && (
+            <p className="text-xs text-stone-500 dark:text-zinc-400">
+              New stock level: {restockTarget.stock + Number.parseInt(restockQty, 10)}
+            </p>
+          )}
+        </form>
+      </Modal>
+
+      <Modal
+        open={adjustTarget !== null}
+        onClose={() => setAdjustTarget(null)}
+        title="Stock count adjustment"
+        subtitle={adjustTarget ? `${adjustTarget.name} · system says ${adjustTarget.stock}` : undefined}
+        size="sm"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setAdjustTarget(null)}>
+              Cancel
+            </Button>
+            <Button type="submit" form="adjust-form" loading={adjustBusy}>
+              Save count
+            </Button>
+          </>
+        }
+      >
+        <form id="adjust-form" onSubmit={(event) => void submitAdjust(event)} className="space-y-3">
+          <label className="block text-xs font-medium">
+            Counted units on shelf
+            <input
+              type="number"
+              min={0}
+              value={adjustCount}
+              onChange={(event) => setAdjustCount(event.target.value)}
+              autoFocus
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-sky-600/30"
+            />
+          </label>
+          <label className="block text-xs font-medium">
+            Reason
+            <input
+              type="text"
+              value={adjustNote}
+              onChange={(event) => setAdjustNote(event.target.value)}
+              placeholder="Damaged, expired, recount…"
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-stone-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-sm focus:outline-none focus:ring-2 focus:ring-sky-600/30"
+            />
+          </label>
+          {adjustTarget && adjustCount && (
+            <p className="text-xs text-stone-500 dark:text-zinc-400">
+              Adjustment:{' '}
+              <span className="font-mono font-semibold">
+                {Number.parseInt(adjustCount, 10) - adjustTarget.stock >= 0 ? '+' : ''}
+                {Number.parseInt(adjustCount, 10) - adjustTarget.stock}
+              </span>
+            </p>
+          )}
+        </form>
+      </Modal>
+
+      <Modal
+        open={historyTarget !== null}
+        onClose={() => {
+          setHistoryTarget(null);
+          setHistory(null);
+        }}
+        title="Stock history"
+        subtitle={historyTarget?.name}
+        size="lg"
+        footer={
+          <Button variant="secondary" onClick={() => setHistoryTarget(null)}>
+            Close
+          </Button>
+        }
+      >
+        {history === null ? (
+          <Spinner label="Loading stock movements…" className="py-8" />
+        ) : history.length === 0 ? (
+          <EmptyState title="No stock movements yet" icon={<History className="w-5 h-5" />} />
+        ) : (
+          <ul className="divide-y divide-stone-100 dark:divide-zinc-800">
+            {history.map((movement) => (
+              <li key={movement.id} className="py-2.5 flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium">
+                    {MOVEMENT_LABELS[movement.reason] ?? movement.reason}
+                    <span className="ml-1.5 text-[11px] text-stone-500 dark:text-zinc-400">
+                      {dateTime(movement.createdAt)}
+                    </span>
+                  </p>
+                  {movement.note && (
+                    <p className="text-[11px] text-stone-500 dark:text-zinc-400 truncate">{movement.note}</p>
+                  )}
+                </div>
+                <span
+                  className={cn(
+                    'font-mono text-sm font-semibold shrink-0',
+                    movement.delta >= 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-600 dark:text-red-400',
+                  )}
+                >
+                  {movement.delta >= 0 ? '+' : ''}
+                  {movement.delta}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+        {historyTarget && (
+          <p className="mt-3 text-[11px] text-stone-400 dark:text-zinc-500">
+            Current stock: {historyTarget.stock} · cost {moneyExact(historyTarget.costPrice, currency)}
+          </p>
+        )}
+      </Modal>
     </div>
   );
 };
